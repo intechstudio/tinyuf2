@@ -1,0 +1,88 @@
+name: Build ESP32 intech
+
+on:
+  push:
+    paths:
+      - 'src/**'
+      - 'ports/espressif/**'
+      - 'lib/tinyusb'
+      - '.github/workflows/build_esp32_intech.yml'
+  pull_request:
+    branches: [ master ]
+    paths:
+      - 'src/**'
+      - 'ports/espressif/**'
+      - 'lib/tinyusb'
+      - '.github/workflows/build_esp32_intech.yml'
+  repository_dispatch:
+  release:
+    types:
+      - created
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------
+  # Build ESP32SX family
+  # ---------------------------------------
+  ESP:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        board:
+        # ----------------------
+        # S3 Alphabetical order
+        # ----------------------
+        - 'intechstudio_grid'
+        - 'intechstudio_knot'
+        - 'magnelit'
+    steps:
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.x"
+
+    - name: Checkout
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+
+    - name: Checkout submodules
+      run: git submodule update --init lib/tinyusb lib/uf2
+
+    - name: Set Env
+      run: echo BIN_PATH=ports/espressif/_bin/${{ matrix.board }} >> $GITHUB_ENV
+
+    - name: Build
+      run: docker run --rm -v $PWD:/project -w /project espressif/idf:v5.1.1 /bin/bash -c "git config --global --add safe.directory /project && make -C ports/espressif/ BOARD=${{ matrix.board }} all self-update copy-artifact"
+
+    - uses: actions/upload-artifact@v3
+      with:
+        name: ${{ matrix.board }}
+        path: ${{ env.BIN_PATH }}
+
+    - name: Prepare Release Asset
+      if: ${{ github.event_name == 'release' }}
+      run: |
+        zip -jr tinyuf2-${{ matrix.board }}-${{ github.event.release.tag_name }}.zip ${{ env.BIN_PATH }}
+        cp ${{ env.BIN_PATH }}/update-tinyuf2.uf2 update-tinyuf2-${{ matrix.board }}-${{ github.event.release.tag_name }}.uf2
+
+    - name: Upload Release Asset
+      uses: softprops/action-gh-release@v1
+      if: ${{ github.event_name == 'release' }}
+      with:
+        files: |
+          tinyuf2-${{ matrix.board }}-*.zip
+          update-tinyuf2-${{ matrix.board }}-*.uf2
+
+    - name: Upload Assets To AWS S3
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      if: ${{ github.event_name == 'release' }}
+      run: |
+        [ -z \"$AWS_ACCESS_KEY_ID\" ] || aws s3 cp tinyuf2-${{ matrix.board }}-${{ github.event.release.tag_name }}.zip s3://adafruit-circuit-python/bootloaders/esp32/tinyuf2-${{ matrix.board }}-${{ github.event.release.tag_name }}.zip --no-progress --region us-east-1
+        [ -z \"$AWS_ACCESS_KEY_ID\" ] || aws s3 cp update-tinyuf2-${{ matrix.board }}-${{ github.event.release.tag_name }}.uf2 s3://adafruit-circuit-python/bootloaders/esp32/update-tinyuf2-${{ matrix.board }}-${{ github.event.release.tag_name }}.uf2 --no-progress --region us-east-1
