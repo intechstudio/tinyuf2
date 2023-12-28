@@ -218,8 +218,8 @@ static int selected_boot_partition(const bootloader_state_t *bs) {
           }
 #endif
           if ( boot_index != FACTORY_INDEX ) {
-            
-            // Only turn the default purple waiting color on if there is actualy waiting happening
+
+            // Only turn the default purple waiting color on if there is actually waiting happening
             if (UF2_DETECTION_DELAY_MS > 0){
               board_led_on();
             }
