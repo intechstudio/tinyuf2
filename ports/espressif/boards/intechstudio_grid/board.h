@@ -64,6 +64,6 @@
 #define UF2_PRODUCT_NAME  USB_MANUFACTURER " " USB_PRODUCT
 #define UF2_BOARD_ID      "ESP32S3-Grid"
 #define UF2_VOLUME_LABEL  "GRID-S3"
-#define UF2_INDEX_URL     "https://intech.studio/"
+#define UF2_INDEX_URL     "https://github.com/intechstudio/grid-fw"
 
 #endif
