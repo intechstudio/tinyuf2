@@ -160,10 +160,12 @@ void BOARD_BootClockRUN(void) {
     rootCfg.div = 1;
     CLOCK_SetRootClock(kCLOCK_Root_Cssys, &rootCfg);
 
-    /* Configure FLEXSPI1 using OSC_RC_48M_DIV2 */
-    rootCfg.mux = kCLOCK_FLEXSPI1_ClockRoot_MuxOscRc48MDiv2;
-    rootCfg.div = 1;
+    /* Configure FLEXSPI1 using OSC_RC_400M (100MHz) */
+    rootCfg.mux = kCLOCK_FLEXSPI1_ClockRoot_MuxOscRc400M;
+    rootCfg.div = 4;
     CLOCK_SetRootClock(kCLOCK_Root_Flexspi1, &rootCfg);
+    FLEXSPI1->MCR0 |= FLEXSPI_MCR0_SWRESET_MASK;
+    while (FLEXSPI1->MCR0 & FLEXSPI_MCR0_SWRESET_MASK) {}
 
     /* Configure GPT1 using OSC_24M for timing */
     rootCfg.mux = kCLOCK_GPT1_ClockRoot_MuxOsc24MOut;

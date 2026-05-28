@@ -71,6 +71,7 @@
 | m5stack_atoms3_lite | M5Stack AtomS3 Lite | 0x303A:0x8160 | https://shop.m5stack.com/products/atoms3-lite-esp32s3-dev-kit |
 | m5stack_atoms3u | M5Stack AtomS3U | 0x303A:0x8188 | https://docs.m5stack.com/en/core/AtomS3U |
 | m5stack_cores3 | M5Stack CoreS3 | 0x303A:0x811B | https://shop.m5stack.com/products/m5stack-cores3-esp32s3-lotdevelopment-kit |
+| m5stack_dial | M5Stack Dial | 0x303A:0x811A | https://docs.m5stack.com/en/core/M5Dial |
 | m5stack_stamps3 | M5Stack Stamp S3 | 0x303A:0x811A | https://docs.m5stack.com/en/core/StampS3 |
 | magiclick_s3_n4r2 | MakerM0 MagiClick S3 | 0x303A:0x81AC | https://github.com/MakerM0/MagiClick-esp32s3 |
 | maker_badge | Czech maker Maker badge | 0x239A:0x2030 | https://github.com/dronecz/maker_badge |
@@ -104,6 +105,7 @@
 | waveshare_esp32_s3_pico | Waveshare Electronics ESP32-S3-Pico | 0x303A:0x81A2 | http://www.waveshare.com/wiki/ESP32-S2-Pico |
 | waveshare_esp32_s3_touch_lcd_169 | Waveshare Electronics ESP32-S3-Touch-LCD-1.69 | 0x303A:0x8220 | https://www.waveshare.com/product/esp32-s3-touch-lcd-1.69.htm |
 | waveshare_esp32_s3_touch_lcd_2 | Waveshare Electronics ESP32-S3-Touch-LCD-2 | 0x303A:0x82CF | https://www.waveshare.com/esp32-s3-touch-lcd-2.htm?sku=29667 |
+| waveshare_esp32_s3_tiny | Waveshare Electronics ESP32-S3-Tiny | 0x303A:0x81F8 | https://www.waveshare.com/wiki/ESP32-S3-Tiny |
 | waveshare_esp32_s3_zero | Waveshare Electronics ESP32-S3-Zero | 0x303A:0x81B3 | https://www.waveshare.com/wiki/ESP32-S3-Zero |
 | waveshare_esp32s2_pico | Waveshare Electronics ESP32-S2-Pico | 0x303A:0x8109 | http://www.waveshare.com/wiki/ESP32-S2-Pico |
 | waveshare_esp32s3_lcd_169 | Waveshare Electronics ESP32-S3-LCD-1.69 | 0x303A:0x8223 | https://www.waveshare.com/product/esp32-s3-lcd-1.69.htm |
