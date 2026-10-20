@@ -15,6 +15,7 @@
 | adafruit_funhouse_esp32s2 | Adafruit FunHouse | 0x239A:0x00F9 | https://www.adafruit.com/ |
 | adafruit_magtag_29gray | Adafruit MagTag 2.9 Grayscale | 0x239A:0x00E5 | https://www.adafruit.com/product/4800 |
 | adafruit_matrixportal_s3 | Adafruit MatrixPortal S3 | 0x239A:0x0125 | https://www.adafruit.com/ |
+| adafruit_metro_esp32p4 | Adafruit Metro ESP32-P4 | 0x239A:0x017B | https://www.adafruit.com |
 | adafruit_metro_esp32s2 | Adafruit Metro ESP32-S2 | 0x239A:0x00DF | https://www.adafruit.com/product/4775 |
 | adafruit_metro_esp32s3 | Adafruit Metro ESP32-S3 | 0x239A:0x0145 | https://www.adafruit.com/product/5500 |
 | adafruit_mylittlehacker_esp32s2 | Adafruit My Little Hacker ESP32-S2 | 0x239A:0x013F | https://www.adafruit.com/products/5742 |
@@ -163,6 +164,13 @@
 | olimex_rt1010 | Olimex RT1010 | 0x15BA:0x0046 | https://www.olimex.com/Products/MicroPython/RT1010-Py |
 | teensy40 | PJRC Teensy 4.0 | 0x239A:0x0085 | https://www.pjrc.com/store/teensy40.html |
 | teensy41 | PJRC Teensy 4.1 | 0x239A:0x00AD | https://www.pjrc.com/store/teensy41.html |
+
+## samd51
+
+| Board | Name | VID PID | URL |
+| --- | --- | --- | --- |
+| intech_grid | Intech Studio Bootloader 2026-10 | 0x03EB:0x2402 | https://github.com/intechstudio/grid-fw/ |
+| intech_wrid | Intech Studio Bootloader 2026-10 | 0x03EB:0x2402 | https://github.com/intechstudio/grid-fw/ |
 
 ## stm32f3
 
