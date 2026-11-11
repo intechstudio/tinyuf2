@@ -1,0 +1,17 @@
+; WS2812 data output, 800 kHz bit rate: one bit is T1 + T2 + T3 PIO cycles
+.program ws2812
+.side_set 1
+
+.define public T1 2
+.define public T2 5
+.define public T3 3
+
+.wrap_target
+bitloop:
+    out x, 1       side 0 [T3 - 1] ; shift one bit out, drive low
+    jmp !x do_zero side 1 [T1 - 1] ; drive high, branch on the bit
+do_one:
+    jmp bitloop    side 1 [T2 - 1] ; a one stays high longer
+do_zero:
+    nop            side 0 [T2 - 1] ; a zero goes low
+.wrap
