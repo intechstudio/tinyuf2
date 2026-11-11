@@ -176,6 +176,7 @@
 | Board | Name | VID PID | URL |
 | --- | --- | --- | --- |
 | intechstudio_grid_rp2350 | Intech Studio Grid RP2350 Bootloader | 0x2E8A:0x1145 | https://github.com/intechstudio/grid-fw/ |
+| intechstudio_wrid_rp2350 | Intech Studio Wrid RP2350 Bootloader | 0x2E8A:0x1145 | https://github.com/intechstudio/grid-fw/ |
 
 ## samd51
 

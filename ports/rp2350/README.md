@@ -9,6 +9,7 @@ Boards:
 | Board | Notes |
 | --- | --- |
 | `intechstudio_grid_rp2350` | 16 WS2812 on GPIO6 (PIO0), volume `GRIDRP2350` |
+| `intechstudio_wrid_rp2350` | Same hardware and USB IDs as `intechstudio_grid_rp2350`, volume `WRIDRP2350`, to tell the two bootloaders apart |
 
 ## Build
 
