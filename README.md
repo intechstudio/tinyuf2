@@ -35,6 +35,7 @@ Not all features are implemented for all MCUs, following is supported MCUs and i
 | LPC55              |  ✔   |      ✔       |             |                  |    ✔     |      |
 | MAX32              |  ✔   |      ✔       |      ✔      |                  |          |      |
 | iMXRT              |  ✔   |      ✔       |      ✔      |                  |    ✔     |      |
+| RP2350             |  ✔   |      ✔       |      ✔      |                  |    ✔     |      |
 | SAMD51             |  ✔   |              |      ✔      |        ✔         |    ✔     |      |
 | STM32F3            |  ✔   |      ✔       |      ✔      |        ✔         |    ✔     |      |
 | STM32F4            |  ✔   |      ✔       |      ✔      |        ✔         |    ✔     |      |
