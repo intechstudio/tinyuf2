@@ -50,7 +50,7 @@ if (NOT DEFINED JLINK_IF)
   set(JLINK_IF swd)
 endif ()
 
-# TUF2_LOG and CFG_TUSB_DEBUG level, off by default as in make
+# TUF2_LOG and CFG_TUSB_DEBUG level, off by default
 if (NOT DEFINED LOG)
   set(LOG 0)
 endif ()
@@ -107,8 +107,8 @@ function(family_gen_bin_hex TARGET)
     VERBATIM)
 endfunction()
 
-# Build an application as its own CMake project (ExternalProject), as make builds each app with its own
-# flags: the app's defines then also reach the board library it compiles.
+# Build an application as its own CMake project (ExternalProject), so it builds with its own flags: the app's
+# defines then also reach the board library it compiles.
 # SELF_UPDATE passes the bootloader binary as BOOTLOADER_BIN, BOARDS limits the app to those boards.
 function(family_add_app NAME SOURCE_DIR)
   cmake_parse_arguments(ARG "SELF_UPDATE" "" "BOARDS" ${ARGN})
@@ -219,6 +219,7 @@ function(family_configure_common TARGET)
 
   # LOGGER option
   if (DEFINED LOGGER)
+    string(TOUPPER "${LOGGER}" LOGGER)
     target_compile_definitions(${TARGET} PUBLIC LOGGER_${LOGGER})
 
     # Add segger rtt to example
@@ -255,6 +256,38 @@ function(family_add_tinyusb TARGET OPT_MCU)
   endif ()
 endfunction()
 
+# UF2 version: git describe, then each of GIT_SUBMODULES' versions; sets OUT_BASE and OUT_VERSION
+function(family_get_uf2_version OUT_BASE OUT_VERSION)
+  execute_process(COMMAND ${GIT_EXECUTABLE} describe --dirty --always --tags
+    WORKING_DIRECTORY ${TOP}
+    OUTPUT_VARIABLE GIT_VERSION ERROR_VARIABLE GIT_ERROR RESULT_VARIABLE GIT_RESULT
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if (NOT GIT_RESULT EQUAL 0)
+    message(FATAL_ERROR "git describe failed: ${GIT_ERROR}")
+  endif ()
+
+  list(TRANSFORM GIT_SUBMODULES PREPEND lib/ OUTPUT_VARIABLE SUBMODULE_PATHS)
+  execute_process(COMMAND ${GIT_EXECUTABLE} submodule status ${SUBMODULE_PATHS}
+    WORKING_DIRECTORY ${TOP}
+    OUTPUT_VARIABLE SUBMODULE_STATUS ERROR_VARIABLE GIT_ERROR RESULT_VARIABLE GIT_RESULT
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if (NOT GIT_RESULT EQUAL 0)
+    message(FATAL_ERROR "git submodule status failed: ${GIT_ERROR}")
+  endif ()
+  string(REPLACE "\n" ";" SUBMODULE_STATUS "${SUBMODULE_STATUS}")
+  set(GIT_SUBMODULE_VERSIONS "")
+  foreach (LINE IN LISTS SUBMODULE_STATUS)
+    # "<state><sha1> lib/<name> (<describe>)" -> "<name> (<describe>)"
+    string(REGEX REPLACE "^.[0-9a-f]+ lib/" "" LINE "${LINE}")
+    list(APPEND GIT_SUBMODULE_VERSIONS "${LINE}")
+  endforeach ()
+  list(JOIN GIT_SUBMODULE_VERSIONS " " GIT_SUBMODULE_VERSIONS)
+
+  cmake_print_variables(GIT_VERSION GIT_SUBMODULE_VERSIONS)
+  set(${OUT_BASE} "${GIT_VERSION}" PARENT_SCOPE)
+  set(${OUT_VERSION} "${GIT_VERSION} - ${GIT_SUBMODULE_VERSIONS}" PARENT_SCOPE)
+endfunction()
+
 function(family_configure_tinyuf2 TARGET OPT_MCU)
   family_configure_common(${TARGET})
 
@@ -263,13 +296,10 @@ function(family_configure_tinyuf2 TARGET OPT_MCU)
 
   family_add_tinyusb(${TARGET} ${OPT_MCU})
 
-  # Add uf2 version
-  execute_process(COMMAND ${GIT_EXECUTABLE} describe --dirty --always --tags WORKING_DIRECTORY ${TOP} OUTPUT_VARIABLE GIT_VERSION)
-  string(STRIP ${GIT_VERSION} GIT_VERSION)
-  cmake_print_variables(GIT_VERSION)
+  family_get_uf2_version(UF2_VERSION_BASE UF2_VERSION)
   target_compile_definitions(${TARGET} PUBLIC
-    UF2_VERSION_BASE="${GIT_VERSION}"
-    UF2_VERSION="${GIT_VERSION}"
+    UF2_VERSION_BASE="${UF2_VERSION_BASE}"
+    UF2_VERSION="${UF2_VERSION}"
     )
 
   # copy bin,hex to ARTIFACT_PATH
@@ -369,9 +399,19 @@ function(family_flash_stlink TARGET)
     set(STM32_PROGRAMMER_CLI STM32_Programmer_CLI)
   endif ()
 
+  if (ARGC GREATER 1)
+    set(BIN_FILE $<TARGET_FILE_DIR:${TARGET}>/${TARGET}.${ARGV1})
+  else ()
+    set(BIN_FILE $<TARGET_FILE:${TARGET}>)
+  endif ()
+
+  if (DEFINED STLINK_SERIAL)
+    set(STLINK_SN sn=${STLINK_SERIAL})
+  endif ()
+
   add_custom_target(${TARGET}-stlink
     DEPENDS ${TARGET}
-    COMMAND ${STM32_PROGRAMMER_CLI} --connect port=swd --write $<TARGET_FILE:${TARGET}> --go
+    COMMAND ${STM32_PROGRAMMER_CLI} --connect port=swd ${STLINK_SN} --write ${BIN_FILE} --go
     )
 endfunction()
 
@@ -386,7 +426,16 @@ function(family_flash_pyocd TARGET)
 endfunction()
 
 
-# Add flash openocd target
+# Add flash target using the STM32 ROM DFU bootloader, binary written at the flash base 0x08000000
+function(family_flash_dfu_util TARGET)
+  add_custom_target(${TARGET}-dfu-util
+    DEPENDS ${TARGET}
+    COMMAND dfu-util -R -a 0 --dfuse-address 0x08000000 -D $<TARGET_FILE_DIR:${TARGET}>/${TARGET}.bin
+    )
+endfunction()
+
+
+# Add flash openocd target, optional parameter is the extension of the binary file
 function(family_flash_openocd TARGET)
   if (NOT DEFINED OPENOCD)
     set(OPENOCD openocd)
@@ -396,6 +445,11 @@ function(family_flash_openocd TARGET)
     set(OPENOCD_OPTION2 "")
   endif ()
 
+  # the probe's "0xVVVV 0xPPPP": discovery then opens no other USB device
+  if (DEFINED OPENOCD_VID_PID)
+    set(OPENOCD_OPTION "-c \"adapter usb vid_pid ${OPENOCD_VID_PID}\" ${OPENOCD_OPTION}")
+  endif ()
+
   if (DEFINED OPENOCD_SERIAL)
     set(OPENOCD_OPTION "-c \"adapter serial ${OPENOCD_SERIAL}\" ${OPENOCD_OPTION}")
   endif ()
@@ -403,10 +457,16 @@ function(family_flash_openocd TARGET)
   separate_arguments(OPTION_LIST UNIX_COMMAND ${OPENOCD_OPTION})
   separate_arguments(OPTION_LIST2 UNIX_COMMAND ${OPENOCD_OPTION2})
 
+  if (ARGC GREATER 1)
+    set(BIN_FILE $<TARGET_FILE_DIR:${TARGET}>/${TARGET}.${ARGV1})
+  else ()
+    set(BIN_FILE $<TARGET_FILE:${TARGET}>)
+  endif ()
+
   # note skip verify since it has issue with rp2040
   add_custom_target(${TARGET}-openocd
     DEPENDS ${TARGET}
-    COMMAND ${OPENOCD} -c "tcl_port disabled; gdb_port disabled" ${OPTION_LIST} -c "init; halt; program $<TARGET_FILE:${TARGET}>" -c reset ${OPTION_LIST2} -c exit
+    COMMAND ${OPENOCD} -c "tcl_port disabled; gdb_port disabled" ${OPTION_LIST} -c "init; halt; program ${BIN_FILE}" -c reset ${OPTION_LIST2} -c exit
     VERBATIM
     )
 endfunction()
@@ -422,10 +482,12 @@ function(family_flash_openocd_wch TARGET)
 endfunction()
 
 
-# Add flash openocd adi (Analog Devices) target
+# Add flash openocd adi (Analog Devices) target, of the HEX the HIL installs
 # included with msdk or compiled from release branch of https://github.com/analogdevicesinc/openocd
 function(family_flash_openocd_adi TARGET)
-  if (DEFINED MAXIM_PATH)
+  if (DEFINED OPENOCD)
+    # the caller's openocd, whose own scripts have the ADI targets
+  elseif (DEFINED MAXIM_PATH)
     # use openocd from msdk with MAXIM_PATH cmake variable first if the user
     # specified it
     set(OPENOCD ${MAXIM_PATH}/Tools/OpenOCD/openocd)
@@ -445,7 +507,7 @@ function(family_flash_openocd_adi TARGET)
     set(OPENOCD_OPTION2 "-s ${OPENOCD_ADI_PATH}/tcl")
   endif ()
 
-  family_flash_openocd(${TARGET})
+  family_flash_openocd(${TARGET} hex)
 endfunction()
 
 
@@ -456,6 +518,9 @@ function(family_flash_uf2 TARGET FAMILY_ID)
     COMMAND ${Python_EXECUTABLE} ${UF2CONV_PY} -f ${FAMILY_ID} --deploy $<TARGET_FILE_DIR:${TARGET}>/${TARGET}.uf2
     )
 endfunction()
+
+# Submodules whose versions UF2_VERSION carries, a family.cmake may change it
+set(GIT_SUBMODULES tinyusb)
 
 # Family specific
 include(${CMAKE_CURRENT_LIST_DIR}/${FAMILY}/family.cmake)

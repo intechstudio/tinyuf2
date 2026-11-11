@@ -2,21 +2,81 @@
 that compile a change, and the JSON and exit code follow SKILL.md. Builds are stubbed here; a real
 build is evidence only from a run of the script itself."""
 import contextlib
+import functools
+import hashlib
 import importlib.util
 import io
 import json
 import os
 import re
+import shutil
+import signal
 import subprocess
+import sys
+import tarfile
 import tempfile
+import textwrap
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / '.claude' / 'skills' / 'build' / 'scripts' / 'check_build.py'
-LPC55_ARTIFACTS = ['_bin/tinyuf2-lpcxpresso55s69.bin', '_bin/tinyuf2-lpcxpresso55s69.hex',
-                   '_bin/apps/update-tinyuf2-lpcxpresso55s69.uf2']
+
+
+FAKE_TOOL = '''#!{python}
+import os, subprocess, sys, time
+from pathlib import Path
+log = Path(os.environ['TOOLS_LOG'])
+container = log.with_name('container')   # the one container the fake daemon holds
+with open(log, 'a') as f:
+  f.write(' '.join([Path(sys.argv[0]).name] + sys.argv[1:]) + '\\n')
+if sys.argv[1] == 'rm':
+  if os.environ.get('RM_HANG'):
+    Path(os.environ['RM_HANG']).touch()
+    time.sleep(60)
+  if os.environ.get('RM_EXIT'):
+    sys.exit(int(os.environ['RM_EXIT']))
+  container.unlink(missing_ok=True)
+  sys.exit(0)
+if sys.argv[1] == 'ps':
+  if os.environ.get('PS_EXIT'):
+    print('Cannot connect to the Docker daemon', file=sys.stderr)
+    sys.exit(int(os.environ['PS_EXIT']))
+  print('c0ffee' if container.exists() else '')
+  sys.exit(0)
+if sys.argv[1] == 'run' and os.environ.get('CREATE_AFTER'):   # the daemon's create, landing after its client is gone
+  subprocess.Popen([sys.executable, '-c', 'import pathlib, sys, time; time.sleep(float(sys.argv[1])); pathlib.Path(sys.argv[2]).touch(); '
+                    'open(sys.argv[3], "a").write("daemon created")', os.environ['CREATE_AFTER'], str(container), str(log)],
+                   start_new_session=True)
+elif sys.argv[1] == 'run':
+  container.touch()
+if os.environ.get('HANG'):
+  with open(os.environ['PIDS'], 'a') as f:
+    f.write(f'{{os.getpid()}} {{subprocess.Popen(["sleep", "60"]).pid}}\\n')
+  time.sleep(60)
+if os.environ.get('UNKNOWN_TARGET'):   # as ninja 1.13 reports it: stderr only, nothing on stdout
+  print(f"ninja: error: unknown target '{{sys.argv[-1]}}'", file=sys.stderr)
+  sys.exit(1)
+print(os.environ.get('STDOUT', "ninja: Entering directory `x'"))
+print('ninja: warning: on stderr', file=sys.stderr)
+'''
+
+
+def alive(pid, wait=2):
+  """Whether `pid` is still a live process (not gone or a zombie) after up to `wait` s."""
+  end = time.monotonic() + wait
+  while True:
+    try:
+      if Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[0] == 'Z':
+        return False
+    except OSError:
+      return False
+    if time.monotonic() >= end:
+      return True
+    time.sleep(0.05)
 
 
 def build_tmpdir():
@@ -28,6 +88,10 @@ def build_tmpdir():
 spec = importlib.util.spec_from_file_location('check_build', SCRIPT)
 cb = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cb)
+# `python3 -c` code, SCRIPT its first argument, that loads it as `cb` in a process of its own
+LOAD_CB = ('import importlib.util, sys; from pathlib import Path; '
+           'spec = importlib.util.spec_from_file_location("check_build", sys.argv[1]); '
+           'cb = importlib.util.module_from_spec(spec); spec.loader.exec_module(cb); ')
 
 
 def ci_jobs():
@@ -41,7 +105,7 @@ def ci_jobs():
     if not toolchain or 'build_util.yml' not in code:
       continue
     ports = re.findall(r"^\s*-\s*'(\w+)'", code, re.M) or re.findall(r"^\s*port:\s*'(\w+)'", code, re.M)
-    backend = 'idf' if toolchain.group(1) == 'esp-idf' else re.search(r"build-system:\s*'(\w+)'", code).group(1)
+    backend = 'idf' if toolchain.group(1) == 'esp-idf' else 'cmake'   # build_util.yml builds every other port with cmake
     for port in ports:
       if re.search(r'^\s*if:\s*false', code, re.M):
         disabled.add(port)
@@ -56,36 +120,228 @@ def classify(path):
 
 
 class TablesMatchTheTree(unittest.TestCase):
-  def test_backends_are_build_yml_jobs(self):
+  def test_the_ports_and_their_backends_are_build_yml_jobs(self):
     enabled, disabled = ci_jobs()
-    self.assertEqual(cb.BACKENDS, enabled)
+    self.assertEqual({p: cb.backend_of(p) for p in cb.REPRESENTATIVES}, enabled)
     self.assertLessEqual(disabled, set(cb.UNBUILT))
 
   def test_every_port_dir_has_a_backend_or_a_reason(self):
     ports = {p.name for p in (ROOT / 'ports').iterdir() if p.is_dir()} - {cb.GHOSTFAT}
-    self.assertEqual(ports, set(cb.BACKENDS) | set(cb.UNBUILT))
+    self.assertEqual(ports, set(cb.REPRESENTATIVES) | set(cb.UNBUILT))
 
   def test_representatives_exist(self):
-    self.assertEqual(set(cb.REPRESENTATIVES), set(cb.BACKENDS))
     for port, boards in cb.REPRESENTATIVES.items():
       for b in boards:
         self.assertTrue((ROOT / 'ports' / port / 'boards' / b).is_dir(), f'{port}/{b}')
     for backend, board in cb.SMOKE.items():
-      self.assertEqual(cb.BACKENDS[cb.port_of(board)], backend)
+      self.assertEqual(cb.backend_of(cb.port_of(board)), backend)
 
   def test_espressif_representatives_cover_every_idf_target(self):
     target = lambda b: re.search(r'IDF_TARGET "(\w+)"', (ROOT / 'ports/espressif/boards' / b / 'board.cmake').read_text())[1]
     every = {target(b.name) for b in (ROOT / 'ports/espressif/boards').iterdir() if (b / 'board.cmake').is_file()}
     self.assertEqual({target(b) for b in cb.REPRESENTATIVES['espressif']}, every)
 
-  def test_no_self_update_ports_echo_a_stub(self):
-    for port in cb.NO_SELF_UPDATE:
-      mk = (ROOT / 'ports' / port / 'Makefile').read_text()
-      recipe = re.search(r'^self-update:.*\n((?:\t.*\n?)*)', mk.replace('\r', ''), re.M)
-      self.assertIn('not implemented', recipe.group(1), port)
+  def test_every_built_port_has_a_cmake_build(self):
+    for port in [*cb.REPRESENTATIVES, *(set(cb.UNBUILT) - {'template_port'})]:
+      self.assertTrue((ROOT / 'ports' / port / 'CMakeLists.txt').is_file(), port)
 
   def test_ci_idf_version_is_read_from_build_yml(self):
     self.assertRegex(cb.ci_idf_version(), r'^v\d+\.\d+')
+
+
+ACTIONS = ROOT / '.github' / 'actions' / 'setup_toolchain'
+ARM_URL = ('https://gitlab.arm.com/api/v4/projects/tooling%2Fgnu-toolchains-for-arm/packages/generic/gnu-toolchain/'
+           '{dir}/arm-gnu-toolchain-{rel}-{host}-arm-none-eabi.tar.xz')
+CURL = """#!/bin/sh
+# curl stand-in: logs its argv, writes $FAKE_BODY to the -o file
+printf '%s\\n' "$@" > "$FAKE_CURL_LOG"
+while [ $# -gt 0 ]; do [ "$1" = -o ] && printf '%s' "$FAKE_BODY" > "$2"; shift; done
+"""
+
+
+class SetupToolchain(unittest.TestCase):
+  """setup_toolchain's manifest, the https and sha256 fetch over it, and the arm-gcc release read from it."""
+  def setUp(self):
+    t = tempfile.TemporaryDirectory()
+    self.addCleanup(t.cleanup)
+    self.tmp = Path(t.name)
+
+  def release(self, manifest):
+    path = self.tmp / 'toolchain.json'
+    path.write_text(manifest if isinstance(manifest, str) else json.dumps(manifest))
+    with mock.patch.object(cb, 'SETUP_TOOLCHAIN', path):
+      return cb.ci_arm_gcc_release()
+
+  def test_every_entry_is_an_https_url_and_its_sha256(self):
+    manifest = json.loads((ACTIONS / 'toolchain.json').read_text())
+    self.assertIn('arm-gcc', manifest)
+    for name, entry in manifest.items():
+      with self.subTest(name):
+        self.assertEqual(set(entry), {'url', 'sha256'})
+        self.assertTrue(entry['url'].startswith('https://'), entry['url'])
+        self.assertRegex(entry['sha256'], r'^[0-9a-f]{64}$')
+
+  def test_the_release_is_read_from_the_arm_gcc_url(self):
+    self.assertRegex(cb.ci_arm_gcc_release(), r'^\d+\.\d+\.rel\d+$')
+    url = ARM_URL.format(dir='14.2.rel1', rel='14.2.rel1', host='x86_64')
+    self.assertEqual(self.release({'arm-gcc': {'url': url, 'sha256': '0' * 64}}), '14.2.rel1')
+    mirror = 'https://example.org/arm/arm-gnu-toolchain-13.3.Rel1-x86_64-arm-none-eabi.tar.xz'   # any layout
+    self.assertEqual(self.release({'arm-gcc': {'url': mirror, 'sha256': '0' * 64}}), '13.3.Rel1')
+
+  def test_a_missing_or_invalid_arm_gcc_entry_fails(self):
+    for what, manifest, error in (
+        ('no manifest', None, 'no arm-gcc url'),
+        ('not json', '{', 'no arm-gcc url'),
+        ('no arm-gcc', {'riscv-gcc': {'url': 'https://x/y.tar.gz'}}, 'no arm-gcc url'),
+        ('a flat url', {'arm-gcc': ARM_URL.format(dir='14.2.rel1', rel='14.2.rel1', host='x86_64')}, 'no arm-gcc url'),
+        ('no url', {'arm-gcc': {'sha256': '0' * 64}}, 'no arm-gcc url'),
+        ('a url not a string', {'arm-gcc': {'url': 14.2}}, 'is no Arm GNU Toolchain'),
+        ('xPack', {'arm-gcc': {'url': 'https://github.com/xpack-dev-tools/arm-none-eabi-gcc-xpack/releases/download/'
+                                      'v14.2.1-1.1/xpack-arm-none-eabi-gcc-14.2.1-1.1-linux-x64.tar.gz'}},
+         'is no Arm GNU Toolchain'),
+        ('plain http', {'arm-gcc': {'url': ARM_URL.format(dir='14.2.rel1', rel='14.2.rel1', host='x86_64')
+                                    .replace('https:', 'http:')}}, 'is no Arm GNU Toolchain'),
+        ('another host', {'arm-gcc': {'url': ARM_URL.format(dir='14.2.rel1', rel='14.2.rel1', host='darwin-arm64')}},
+         'is no Arm GNU Toolchain'),
+        ('another target', {'arm-gcc': {'url': ARM_URL.format(dir='14.2.rel1', rel='14.2.rel1', host='x86_64')
+                                        .replace('-arm-none-eabi', '-aarch64-none-elf')}}, 'is no Arm GNU Toolchain'),
+        ('a suffixed package', {'arm-gcc': {'url': ARM_URL.format(dir='14.2.rel1', rel='14.2.rel1', host='x86_64')
+                                            .replace('.tar.xz', '-debug.tar.xz')}}, 'is no Arm GNU Toolchain')):
+      with self.subTest(what):
+        if manifest is None:
+          with mock.patch.object(cb, 'SETUP_TOOLCHAIN', self.tmp / 'none.json'), self.assertRaisesRegex(cb.Fail, error):
+            cb.ci_arm_gcc_release()
+          continue
+        with self.assertRaisesRegex(cb.Fail, error):
+          self.release(manifest)
+
+  def fetch(self, manifest, name, body):
+    """The action's fetch.sh run from a copy beside `manifest`, with curl a stand-in that serves `body`."""
+    (self.tmp / 'download').mkdir(exist_ok=True)
+    script = self.tmp / 'download' / 'fetch.sh'
+    script.write_bytes((ACTIONS / 'download' / 'fetch.sh').read_bytes())
+    script.chmod(0o755)
+    (self.tmp / 'toolchain.json').write_text(json.dumps(manifest))
+    bin_dir = self.tmp / 'bin'
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / 'curl').write_text(CURL)
+    (bin_dir / 'curl').chmod(0o755)
+    log = self.tmp / 'curl.log'
+    log.unlink(missing_ok=True)
+    out = self.tmp / 'out.bin'
+    out.unlink(missing_ok=True)
+    env = dict(os.environ, PATH=f'{bin_dir}{os.pathsep}{os.environ["PATH"]}', FAKE_CURL_LOG=str(log), FAKE_BODY=body)
+    r = subprocess.run(['bash', str(script), name, str(out)], env=env, capture_output=True, text=True)
+    return r, (log.read_text().splitlines() if log.exists() else None), out
+
+  @unittest.skipUnless(shutil.which('jq') and shutil.which('bash'), 'fetch.sh needs jq and bash')
+  def test_fetch_takes_https_only_and_keeps_a_download_only_with_its_sha256(self):
+    body = 'toolchain bytes'
+    sha = hashlib.sha256(body.encode()).hexdigest()
+    url = 'https://example.invalid/t.tar.xz'
+    r, argv, out = self.fetch({'t': {'url': url, 'sha256': sha}}, 't', body)
+    self.assertEqual(r.returncode, 0, r.stderr)
+    self.assertEqual(out.read_text(), body)
+    self.assertEqual(argv[argv.index('--proto') + 1], '=https')
+    self.assertEqual(argv[argv.index('--proto-redir') + 1], '=https')
+    self.assertIn(url, argv)
+    r, argv, _ = self.fetch({'t': {'url': url, 'sha256': '0' * 64}}, 't', body)
+    self.assertNotEqual(r.returncode, 0, 'a checksum mismatch is refused')
+    self.assertIn('FAILED', r.stdout + r.stderr)
+    for what, manifest in (('no entry', {'u': {'url': url, 'sha256': sha}}), ('no sha256', {'t': {'url': url}})):
+      with self.subTest(what):
+        r, argv, _ = self.fetch(manifest, 't', body)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIsNone(argv, 'nothing is downloaded')
+
+  def step(self, action, name):
+    """The `run` of `action`'s step `name`, dedented."""
+    text = action.read_text().split(f'    - name: {name}\n', 1)[1]
+    run = re.search(r"      run: (?:\|\n((?:        .*\n|\n)+)|'(.*)'\n)", text)
+    return textwrap.dedent(run[1]) if run[1] else run[2]
+
+  def test_the_cache_is_keyed_on_the_entrys_sha256_which_must_be_given(self):
+    manifest = json.loads((ACTIONS / 'toolchain.json').read_text())
+    out = self.tmp / 'github-output'
+    r = subprocess.run(['bash', '-e', '-c', self.step(ACTIONS / 'action.yml', 'Get Toolchain URL')], cwd=ROOT,
+                       capture_output=True, text=True, env=dict(os.environ, TOOLCHAIN='arm-gcc', GITHUB_OUTPUT=str(out)))
+    self.assertEqual(r.returncode, 0, r.stderr)
+    self.assertEqual(dict(ln.split('=', 1) for ln in out.read_text().splitlines()),
+                     {'toolchain_url': manifest['arm-gcc']['url'], 'toolchain_sha256': manifest['arm-gcc']['sha256']})
+    download = ACTIONS / 'download' / 'action.yml'
+    self.assertIn('key: ${{ runner.os }}-${{ inputs.toolchain }}-${{ inputs.toolchain_sha256 }}\n', download.read_text())
+    check = self.step(download, "Check the toolchain's sha256")
+    for sha, code in (('', 1), ('0' * 64, 0)):
+      with self.subTest(sha=sha):
+        r = subprocess.run(['bash', '-e', '-c', check], capture_output=True, text=True, env=dict(os.environ, SHA256=sha))
+        self.assertEqual(r.returncode, code, r.stdout)
+
+  def install(self, action, toolchain, url, payload):
+    """`action`'s Install Toolchain script run in a fresh git checkout, as a composite step runs it, with fetch.sh a
+    stand-in that writes `payload`: its exit, the checkout's `git status --porcelain` and the fake HOME. Every GIT_*
+    variable is dropped: a pre-commit hook's GIT_DIR and GIT_INDEX_FILE would aim this git at the checkout under test."""
+    clean = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+    text = action.read_text()
+    body = text.split('    - name: Install Toolchain\n', 1)[1].split('      run: |\n', 1)[1].split('      shell: bash\n')[0]
+    root = Path(tempfile.mkdtemp(dir=self.tmp))
+    repo, home, temp = root / 'repo', root / 'home', root / 'runner-temp'
+    for d in (repo, home, temp):
+      d.mkdir()
+    git = ['git', '-C', str(repo), '-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false']
+    (repo / 'README').write_text('x')
+    for cmd in (['init', '-q'], ['add', 'README'], ['commit', '-qm', 'x']):
+      subprocess.run([*git, *cmd], env=clean, check=True)
+    self.assertEqual(Path(subprocess.run([*git, 'rev-parse', '--absolute-git-dir'], env=clean, capture_output=True,
+                                         text=True, check=True).stdout.strip()).resolve(), (repo / '.git').resolve())
+    (root / 'payload').write_bytes(payload)
+    fetch = root / 'fetch.sh'
+    fetch.write_text(f'#!/bin/sh\ncp {root / "payload"} "$2"\n')
+    fetch.chmod(0o755)
+    env = dict(clean, HOME=str(home), RUNNER_TEMP=str(temp), TOOLCHAIN=toolchain, TOOLCHAIN_URL=url,
+               FETCH=str(fetch))
+    r = subprocess.run(['bash', '--noprofile', '--norc', '-eo', 'pipefail', '-c', textwrap.dedent(body)], cwd=repo,
+                       env=env, capture_output=True, text=True)
+    status = subprocess.run([*git, 'status', '--porcelain'], env=clean, capture_output=True, text=True, check=True).stdout
+    return r, status, home
+
+  def test_installing_leaves_the_checkout_clean(self):
+    """An untracked download in the checkout would make check_build's identity dirty, which admission refuses."""
+    def archive(mode):
+      buf = io.BytesIO()
+      with tarfile.open(fileobj=buf, mode=f'w:{mode}') as t:
+        info = tarfile.TarInfo('tc/bin/gcc')
+        info.size = 2
+        t.addfile(info, io.BytesIO(b'cc'))
+      return buf.getvalue()
+    action = ACTIONS / 'download' / 'action.yml'
+    installer = b'#!/bin/sh\nmkdir -p "$2/bin"\n'   # rx-gcc's .run: -p <dir> -y
+    for toolchain, url, payload, installed in (
+        ('arm-gcc', ARM_URL.format(dir='14.2.rel1', rel='14.2.rel1', host='x86_64'), archive('xz'), 'tc/bin/gcc'),
+        ('riscv-gcc', 'https://x/t.tar.gz', archive('gz'), 'tc/bin/gcc'),
+        ('msp430-gcc', 'https://x/t.tar.bz2', archive('bz2'), 'tc/bin/gcc'),
+        ('rx-gcc', 'https://x/t.run', installer, 'gnurx/bin'),
+        ('arm-iar', 'https://x/cxarm.deb', b'deb', 'cxarm.deb')):
+      with self.subTest(toolchain):
+        r, status, home = self.install(action, toolchain, url, payload)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(status, '', 'the install left files in the checkout')
+        self.assertTrue((home / 'cache' / toolchain / installed).exists())
+
+  def test_setup_takes_exactly_one_bin_dir(self):
+    """An unmatched glob stays one literal word in bash: an empty cache must fail, not put the pattern on PATH."""
+    setup = self.step(ACTIONS / 'download' / 'action.yml', 'Setup Toolchain')
+    for dirs, code in (((), 1), (('a',), 0), (('a', 'b'), 1)):
+      with self.subTest(dirs=dirs):
+        home = Path(tempfile.mkdtemp(dir=self.tmp))
+        (home / 'cache' / 'arm-gcc').mkdir(parents=True)
+        for d in dirs:
+          (home / 'cache' / 'arm-gcc' / d / 'bin').mkdir(parents=True)
+        path = home / 'github-path'
+        r = subprocess.run(['bash', '--noprofile', '--norc', '-e', '-c', setup], capture_output=True, text=True,
+                           env=dict(os.environ, HOME=str(home), TOOLCHAIN='arm-gcc', GITHUB_PATH=str(path)))
+        self.assertEqual(r.returncode, code, r.stdout + r.stderr)
+        self.assertEqual(path.read_text() if path.exists() else '',
+                         f'{home}/cache/arm-gcc/a/bin\n' if code == 0 else '')
 
 
 class Selection(unittest.TestCase):
@@ -93,22 +349,14 @@ class Selection(unittest.TestCase):
     self.assertEqual(classify('ports/stm32f4/boards/stm32f411ce_blackpill/board.h'),
                      ('board', 'select', [('stm32f411ce_blackpill', 'cmake')], False, False))
 
-  def test_build_file_the_backend_never_reads_is_uncovered(self):
-    for path in ('ports/stm32f4/boards/stm32f411ce_blackpill/board.mk', 'ports/stm32f4/apps/self_update/Makefile',
-                 'ports/mimxrt10xx/apps/app.mk', 'ports/espressif/Makefile', 'ports/lpc55/Makefile'):
-      self.assertEqual(classify(path)[:2], ('other-backend', 'gap'), path)
-
-  def test_shared_make_file_selects_make_ports_and_the_codeql_build(self):
-    make_reps = [(b, 'make') for p, be in cb.BACKENDS.items() if be == 'make' for b in cb.REPRESENTATIVES[p]]
-    for path in ('ports/make.mk', 'ports/rules.mk'):
-      rule, effect, boards, _, _ = classify(path)
-      self.assertEqual((rule, effect), ('make-shared', 'select'), path)
-      self.assertEqual(boards, sorted(make_reps + [('feather_stm32f405_express', 'make')]), path)
-
-  def test_make_files_codeql_builds_select_its_make_build(self):
-    for path in ('ports/stm32f4/Makefile', 'ports/stm32f4/port.mk',
-                 'ports/stm32f4/boards/feather_stm32f405_express/board.mk', '.github/workflows/codeql-buildscript.sh'):
-      self.assertEqual(classify(path)[2], [('feather_stm32f405_express', 'make')], path)
+  def test_codeql_builds_its_board_with_cmake_from_an_empty_dir(self):
+    _, board = cb.codeql_build()
+    self.assertEqual(cb.classify(cb.CODEQL)['boards'], {(board, 'cmake'): 'codeql build'})
+    cmds = [l.split() for l in (ROOT / cb.CODEQL).read_text().splitlines() if l.strip() and not l.lstrip().startswith('#')]
+    self.assertNotIn('make', [c[0] for c in cmds])
+    # CodeQL sees only the compiles it traces: stale output in the build dir would hide sources from it
+    clear = next(i for i, c in enumerate(cmds) if c[:2] == ['rm', '-rf'] and c[2].strip('"') == '$BUILD')
+    self.assertLess(clear, next(i for i, c in enumerate(cmds) if c[0] == 'cmake'))
 
   def test_port_file_selects_its_representatives(self):
     rule, effect, boards, _, _ = classify('ports/mimxrt10xx/board_flash.c')
@@ -121,13 +369,22 @@ class Selection(unittest.TestCase):
                      [('imxrt1064_evk', 'cmake'), ('imxrt1170_evk', 'cmake')])
 
   def test_app_nothing_builds_is_uncovered(self):
-    self.assertEqual(classify('ports/stm32l4/apps/erase_firmware/Makefile')[:2], ('port-app', 'gap'))
+    self.assertEqual(classify('ports/stm32l4/apps/erase_firmware/main.c')[:2], ('port-app', 'gap'))
     self.assertEqual(classify('ports/espressif/apps/erase_firmware/main/CMakeLists.txt')[:2], ('port-app', 'gap'))
     self.assertEqual(classify('ports/espressif/apps/blinky/main/CMakeLists.txt')[:2], ('port-app', 'select'))
 
   def test_top_level_app_selects_ports_whose_backend_compiles_it(self):
     ports = {cb.port_of(b) for b, _ in classify('apps/blinky/src/blinky.c')[2]}
-    self.assertEqual(ports, {'espressif', 'maxim', 'mimxrt10xx', 'stm32f3', 'stm32f4', 'stm32h5'})
+    self.assertEqual(ports, {'espressif', 'lpc55', 'maxim', 'mimxrt10xx', 'samd51', 'stm32f3', 'stm32f4', 'stm32h5',
+                             'stm32h7'})
+
+  def test_a_ports_cmake_files_select_its_cmake_build(self):
+    for port in ('kinetis_k32l2', 'stm32h7', 'stm32l4'):
+      reps = sorted((b, 'cmake') for b in cb.REPRESENTATIVES[port])
+      for path in (f'ports/{port}/CMakeLists.txt', f'ports/{port}/family.cmake'):
+        self.assertEqual(classify(path)[:3], ('port', 'select', reps), path)
+    self.assertEqual(classify('ports/stm32h7/boards/daisy_seed/board.cmake')[:3],
+                     ('board', 'select', [('daisy_seed', 'cmake')]))
 
   def test_dependency_selects_the_ports_get_deps_names(self):
     self.assertEqual(classify('lib/mcu/st/cmsis_device_f4/x.h')[2],
@@ -146,13 +403,21 @@ class Selection(unittest.TestCase):
   def test_build_control_runs_tests_and_one_smoke_build_per_backend(self):
     rule, effect, boards, _, tests = classify('.claude/skills/build/scripts/check_build.py')
     self.assertEqual((rule, effect, tests), ('build-control', 'select', True))
-    self.assertEqual(sorted(b for _, b in boards), ['cmake', 'idf', 'make'])
+    self.assertEqual(sorted(b for _, b in boards), ['cmake', 'idf'])
     self.assertTrue(cb.classify('.claude/skills/build/scripts/check_build.py')['hil'])   # hil_test.py imports it
     self.assertFalse(cb.classify('.github/workflows/build.yml')['hil'])
 
+  def test_the_code_size_scripts_run_the_tests_only(self):
+    for path in ('.claude/skills/build/scripts/code_size.py', '.claude/skills/build/scripts/code_size_profile.py'):
+      r = cb.classify(path)
+      self.assertEqual((r['rule'], r['tests'], r['hil'], r['boards'], r['ci']), ('code-size', True, False, {}, {}), path)
+    self.assertEqual(classify('.claude/test/test_code_size.py'), ('contract-tests', 'select', [], False, True))
+
   def test_unknown_port_fails_explicitly(self):
-    with self.assertRaises(cb.Fail):
-      cb.backend_of('no_such_port')
+    for fail in (lambda: cb.backend_of('no_such_port'), lambda: cb.classify('ports/no_such_port/x.c')):
+      with mock.patch.object(Path, 'is_dir', lambda self: True), \
+           self.assertRaisesRegex(cb.Fail, 'add it to REPRESENTATIVES or UNBUILT'):
+        fail()
 
   def test_contract_test_edit_runs_the_tests_only(self):
     self.assertEqual(classify('.claude/test/test_build.py'), ('contract-tests', 'select', [], False, True))
@@ -160,19 +425,29 @@ class Selection(unittest.TestCase):
   def test_unreadable_codeql_script_fails_explicitly(self):
     cb.codeql_build.cache_clear()
     self.addCleanup(cb.codeql_build.cache_clear)
-    with mock.patch.object(Path, 'read_text', lambda self, *a, **k: 'cmake -B build\n'):
-      with self.assertRaises(cb.Fail):
-        cb.codeql_build()
+    for text in ('cmake -B build\n', 'PORT=stm32f4\nBOARD=a\nBOARD=b\n', 'PORT=stm32f4\nBOARD="$X"\n'):
+      cb.codeql_build.cache_clear()
+      with self.subTest(text), mock.patch.object(Path, 'read_text', lambda self, *a, **k: text):
+        with self.assertRaises(cb.Fail):
+          cb.codeql_build()
 
   def test_nothing_to_build(self):
     for path in ('README.md', '.claude/skills/build/SKILL.md', 'tools/gen_boards.py', '.github/workflows/codeql.yml'):
       self.assertEqual(classify(path)[1], 'none', path)
 
+  def test_agentrc_is_no_submodule_and_no_firmware_input(self):
+    paths = subprocess.run(['git', 'config', '-f', str(ROOT / '.gitmodules'), '--get-regexp', 'path'],
+                           capture_output=True, text=True).stdout.split()
+    self.assertNotIn('lib/agentrc', paths)
+    self.assertNotIn('lib/agentrc', cb.SUBMODULES)
+    self.assertFalse([p for p in cb.HIL_CONTROL if 'lib/agentrc'.startswith(p) or p.startswith('lib/')])
+
   def test_hil_runner_and_roster_select_tests_and_every_roster_board(self):
-    for path in ('.claude/skills/hil/scripts/hil_test.py', 'test/hil/local.json'):
+    for path in ('.claude/skills/hil-contract/scripts/hil_test.py', 'test/hil/local.json', 'test/hil/ci.json',
+                 '.claude/skills/hil-contract/scripts/agentrc.py', 'test/hil/agentrc.json', '.github/workflows/hil.yml'):
       r = cb.classify(path)
       self.assertEqual((r['rule'], r['tests'], r['hil'], r['boards']), ('hil-control', True, True, {}), path)
-    self.assertEqual(cb.classify('.claude/skills/hil/SKILL.md')['effect'], 'none')   # wording costs no hardware
+    self.assertEqual(cb.classify('.claude/skills/hil-contract/SKILL.md')['effect'], 'none')   # wording costs no hardware
     self.assertEqual(classify('.claude/test/test_hil.py'), ('contract-tests', 'select', [], False, True))
 
   def test_core_and_unclassified_select_every_representative(self):
@@ -207,7 +482,6 @@ class CiSelection(unittest.TestCase):
     for path, ports in (('ports/mimxrt10xx/board_flash.c', ['mimxrt10xx']),
                         ('ports/lpc55/boards/no_such_board/board.h', ['lpc55']),   # a deleted board
                         ('lib/mcu/st/cmsis_device_f4/x.h', ['stm32f4']),
-                        ('ports/make.mk', [p for p, be in cb.BACKENDS.items() if be == 'make']),
                         ('apps/blinky/src/blinky.c', cb.ports_using_app('blinky'))):
       self.assertEqual(ci(path), {'full': False, 'ports': {p: cb.boards_of(p) for p in sorted(ports)},
                                   'ghostfat': False}, path)
@@ -231,8 +505,7 @@ class CiSelection(unittest.TestCase):
 
   def test_paths_no_build_job_compiles_select_nothing(self):
     for path in ('README.md', '.claude/test/test_build.py', 'test/hil/local.json', '.github/workflows/codeql.yml',
-                 '.github/workflows/codeql-buildscript.sh', 'ports/stm32f4/Makefile', 'ports/ch32v20x/boards.c',
-                 'ports/lpc55/apps/erase_firmware/Makefile'):
+                 '.github/workflows/codeql-buildscript.sh', 'ports/ch32v20x/boards.c', 'test/hil/agentrc.json'):
       self.assertEqual(ci(path), {'full': False, 'ports': {}, 'ghostfat': False}, path)
 
   def test_selections_union_and_a_whole_port_absorbs_its_boards(self):
@@ -248,9 +521,52 @@ class CiSelection(unittest.TestCase):
       r = cb.classify(path)
       if r['ci'] == cb.FULL:
         continue
-      local = {b for b, _ in r['boards']} - ({codeql_board} if r['rule'] in ('codeql', 'make-shared') else set())
+      local = {b for b, _ in r['boards']} - ({codeql_board} if r['rule'] == 'codeql' else set())
       covered = {b for p, boards in r['ci'].items() for b in (cb.boards_of(p) if boards is None else boards)}
       self.assertLessEqual(local, covered, path)
+
+
+class MakeFiles(unittest.TestCase):
+  """No build reads a Makefile or .mk: a deleted one builds nothing, and one in the tree is refused rather than
+  counted uncovered. ROOT is an empty tree the test fills."""
+  DELETED = ('ports/make.mk', 'ports/stm32f4/Makefile', 'ports/stm32f4/boards/feather_stm32f405_express/board.mk',
+             'ports/mimxrt10xx/apps/app.mk', 'ports/template_port/Makefile', 'ports/test_ghostfat/Makefile', 'src/x.mk')
+
+  def setUp(self):
+    tmp = tempfile.TemporaryDirectory()
+    self.addCleanup(tmp.cleanup)
+    self.root = Path(tmp.name)
+    patch = mock.patch.object(cb, 'ROOT', self.root)
+    patch.start()
+    self.addCleanup(patch.stop)
+
+  def test_a_deleted_make_file_builds_nothing_and_is_never_uncovered(self):
+    for path in self.DELETED:
+      self.assertEqual(classify(path), ('make-removed', 'none', [], False, False), path)
+    sel = cb.select(list(self.DELETED))
+    self.assertEqual((sel['full'], sel['boards'], path_effects(sel)), (False, {}, {'none'}))
+    self.assertEqual(cb.ci_selection(sel), {'full': False, 'ports': {}, 'ghostfat': False})
+    (self.root / 'roster.json').write_text(json.dumps({'boards': []}))
+    self.assertEqual(cb.hil_selection(sel, 'roster.json')['uncovered'], [])
+
+  def test_a_make_file_in_the_tree_is_refused(self):
+    (self.root / 'ports/stm32f4/boards/new_board').mkdir(parents=True)
+    (self.root / 'ports/stm32f4/boards/new_board/board.mk').write_text('all:\n')
+    (self.root / 'ports/stm32f4/Makefile').symlink_to(self.root / 'gone')   # dangling: present, not deleted
+    for path in ('ports/stm32f4/boards/new_board/board.mk', 'ports/stm32f4/Makefile'):
+      with self.assertRaisesRegex(cb.Fail, f'^{re.escape(path)}: a Makefile or .mk'):
+        cb.classify(path)
+    code, r = run_main(['--select-only', '--scope', 'ports/stm32f4/boards/new_board/board.mk'])
+    self.assertEqual(code, 2)
+    self.assertIn('build it with CMake or delete it', r['error'])
+
+  def test_a_dependencys_own_make_files_follow_the_dependency_rule(self):
+    with mock.patch.object(cb, 'get_deps_table', lambda: {'lib/mcu/st/dep': ('x', ['stm32f4'])}):
+      self.assertEqual(cb.classify('lib/mcu/st/dep/Makefile')['rule'], 'dep')
+
+
+def path_effects(sel):
+  return {r['effect'] for r in sel['records']}
 
 
 class ScratchRepo(unittest.TestCase):
@@ -355,7 +671,7 @@ class HilSelection(unittest.TestCase):
     self.assertEqual((h['boards'], h['uncovered']), ([], []))
 
   def test_a_runner_change_selects_every_roster_board(self):
-    h = self.hil('.claude/skills/hil/scripts/hil_test.py')
+    h = self.hil('.claude/skills/hil-contract/scripts/hil_test.py')
     self.assertEqual((h['full'], h['boards'], h['uncovered']), (True, ['lpcxpresso55s69'], []))
 
   def test_a_change_to_the_build_script_the_runner_imports_selects_every_roster_board(self):
@@ -369,12 +685,12 @@ class HilSelection(unittest.TestCase):
     self.assertNotIn('lpc55', [u['target'] for u in h['uncovered']])
 
   def test_a_port_without_a_roster_board_is_uncovered_even_beside_a_runner_change(self):
-    h = self.hil('ports/stm32f4/board_flash.c', 'ports/lpc55/boards.c', '.claude/skills/hil/scripts/hil_test.py')
+    h = self.hil('ports/stm32f4/board_flash.c', 'ports/lpc55/boards.c', '.claude/skills/hil-contract/scripts/hil_test.py')
     self.assertEqual(h['boards'], ['lpcxpresso55s69'])
     self.assertEqual([u['target'] for u in h['uncovered']], ['stm32f4'])
 
   def test_a_build_gap_stays_uncovered_beside_a_runner_change(self):
-    h = self.hil('ports/ch32v20x/board_flash.c', '.claude/skills/hil/scripts/hil_test.py')
+    h = self.hil('ports/ch32v20x/board_flash.c', '.claude/skills/hil-contract/scripts/hil_test.py')
     self.assertEqual(h['boards'], ['lpcxpresso55s69'])
     self.assertEqual([u['target'] for u in h['uncovered']], ['ports/ch32v20x/board_flash.c'])
 
@@ -397,7 +713,7 @@ class HilSelection(unittest.TestCase):
     self.roster.write_text(json.dumps({'boards': [{'name': 'imxrt1060_evk', 'flasher': {'name': 'jlink'}},
                                                   {'name': 'espressif_esp32s3_devkitc_1', 'flasher': {'name': 'esptool'}}]}))
     rt_gap = {'target': 'apps/dfu_runtime/src/nonce.c on mimxrt10xx',
-              'reason': f'no {self.config} esptool board of mimxrt10xx runs dfu_runtime'}
+              'reason': f'no {self.config} Espressif board of mimxrt10xx runs dfu_runtime'}
     h = self.hil('apps/dfu_runtime/src/nonce.c')   # espressif and mimxrt10xx build it; only the S3 runs it
     self.assertEqual((h['boards'], h['uncovered']), (['espressif_esp32s3_devkitc_1'], [rt_gap]))
     h = self.hil('apps/dfu_runtime/src/nonce.c', 'src/main.c')   # the whole roster's battery still never runs it on RT
@@ -407,7 +723,7 @@ class HilSelection(unittest.TestCase):
     self.assertEqual((h['boards'], h['uncovered']), (['espressif_esp32s3_devkitc_1'], []))
     h = self.hil('ports/mimxrt10xx/apps/dfu_runtime/board_dfu_runtime.c')
     self.assertEqual((h['boards'], [u['reason'] for u in h['uncovered']]),
-                     ([], [f'no {self.config} esptool board of mimxrt10xx runs dfu_runtime']))
+                     ([], [f'no {self.config} Espressif board of mimxrt10xx runs dfu_runtime']))
     h = self.hil('apps/blinky/src/blinky.c', 'ports/espressif/apps/blinky/main/CMakeLists.txt')
     self.assertEqual((h['boards'], len(h['uncovered'])), ([], 2))
     self.roster.write_text(json.dumps({'boards': [{'name': 'imxrt1060_evk', 'flasher': {'name': 'jlink'}}]}))
@@ -415,23 +731,21 @@ class HilSelection(unittest.TestCase):
     self.assertEqual((h['boards'], sorted(u['target'] for u in h['uncovered'])),
                      ([], ['apps/dfu_runtime/src/nonce.c on espressif', 'apps/dfu_runtime/src/nonce.c on mimxrt10xx']))
 
-  def test_the_hil_follows_its_cmake_build_not_cis_make(self):
+  def test_a_cmake_file_is_named_by_its_path_when_no_roster_board_builds_it(self):
     self.roster.write_text(json.dumps({'boards': [{'name': 'imxrt1060_evk'}]}))
     h = self.hil('ports/mimxrt10xx/family.cmake', 'ports/mimxrt10xx/boards/imxrt1060_evk/board.cmake')
     self.assertEqual((h['boards'], h['uncovered']), (['imxrt1060_evk'], []))
-    h = self.hil('ports/mimxrt10xx/port.mk', 'ports/mimxrt10xx/boards/imxrt1064_evk/board.cmake')
+    h = self.hil('ports/mimxrt10xx/boards/imxrt1064_evk/board.cmake')
     self.assertEqual(h['boards'], [])
     self.assertEqual({u['target']: u['reason'] for u in h['uncovered']},
-                     {'ports/mimxrt10xx/port.mk': 'the HIL builds with cmake, which never reads ports/mimxrt10xx/port.mk',
-                      'ports/mimxrt10xx/boards/imxrt1064_evk/board.cmake':
+                     {'ports/mimxrt10xx/boards/imxrt1064_evk/board.cmake':
                         f'no {self.config} board builds ports/mimxrt10xx/boards/imxrt1064_evk/board.cmake'})
 
-  def test_shared_make_files_and_port_apps_are_outside_the_hil_build(self):
+  def test_port_apps_are_outside_the_hil_build(self):
     self.roster.write_text(json.dumps({'boards': [{'name': 'imxrt1060_evk'}]}))
-    h = self.hil('ports/make.mk', 'ports/mimxrt10xx/apps/factory_test/CMakeLists.txt')
+    h = self.hil('ports/mimxrt10xx/apps/factory_test/CMakeLists.txt')
     self.assertEqual((h['full'], h['boards']), (False, []))
-    self.assertEqual([u['target'] for u in h['uncovered']],
-                     ['ports/make.mk', 'ports/mimxrt10xx/apps/factory_test/CMakeLists.txt'])
+    self.assertEqual([u['target'] for u in h['uncovered']], ['ports/mimxrt10xx/apps/factory_test/CMakeLists.txt'])
     self.assertEqual(self.hil('ports/family_support.cmake')['boards'], ['imxrt1060_evk'])
 
   def test_an_app_source_is_uncovered_since_the_battery_runs_no_app(self):
@@ -443,6 +757,60 @@ class HilSelection(unittest.TestCase):
     self.assertEqual([u['target'] for u in h['uncovered']], [shared, app])
     h = self.hil(app, 'ports/mimxrt10xx/board_flash.c')   # a bootloader change beside it still runs the battery
     self.assertEqual((h['boards'], [u['target'] for u in h['uncovered']]), (['imxrt1060_evk'], [app]))
+
+  def test_a_former_make_ports_board_builds_with_cmake_for_ci_and_the_hil(self):
+    self.roster.write_text(json.dumps({'boards': [{'name': 'swan_r5'}]}))
+    board = 'ports/stm32l4/boards/swan_r5'
+    self.assertEqual(sorted(cb.select([f'{board}/board.cmake'])['boards']), [('swan_r5', 'cmake')])
+    for path in (f'{board}/board.h', f'{board}/board.cmake', board):
+      h = self.hil(path)
+      self.assertEqual((h['boards'], h['uncovered']), (['swan_r5'], []), path)
+
+  def test_a_ports_cmake_file_selects_its_roster_boards(self):
+    self.roster.write_text(json.dumps({'boards': [{'name': 'swan_r5'}]}))
+    self.assertEqual(classify('ports/stm32l4/CMakeLists.txt')[:3], ('port', 'select', [('swan_r5', 'cmake')]))
+    h = self.hil('ports/stm32l4/CMakeLists.txt')
+    self.assertEqual((h['full'], h['boards'], h['uncovered']), (False, ['swan_r5'], []))
+    h = self.hil('ports/stm32h7/CMakeLists.txt')
+    self.assertEqual((h['boards'], h['uncovered']),
+                     ([], [{'target': 'ports/stm32h7/CMakeLists.txt',
+                            'reason': f'no {self.config} board builds ports/stm32h7/CMakeLists.txt'}]))
+
+  def test_a_port_without_a_roster_board_is_uncovered_under_the_hils_backend(self):
+    h = self.hil('ports/stm32h7/board_flash.c', 'ports/kinetis_k32l2/boards/frdm_k32l2b/board.h')
+    self.assertEqual(h['boards'], [])
+    self.assertEqual({u['target']: u['reason'] for u in h['uncovered']},
+                     {'stm32h7': f'ports/stm32h7/board_flash.c: no {self.config} board for stm32h7',
+                      'frdm_k32l2b': f'ports/kinetis_k32l2/boards/frdm_k32l2b/board.h: frdm_k32l2b is not in {self.config}'})
+
+  def test_an_app_the_hils_build_compiles_stays_outside_the_battery(self):
+    self.roster.write_text(json.dumps({'boards': [{'name': 'daisy_seed'}]}))
+    self.assertIn(('daisy_seed', 'cmake'), cb.select(['apps/erase_firmware/src/main.c'])['boards'])
+    h = self.hil('apps/erase_firmware/src/main.c')
+    self.assertEqual((h['boards'], [u['target'] for u in h['uncovered']]), ([], ['apps/erase_firmware/src/main.c']))
+
+  def test_a_dependency_pin_selects_the_roster_boards_of_its_ports(self):
+    self.roster.write_text(json.dumps({'boards': [{'name': 'daisy_seed'}, {'name': 'swan_r5'}]}))
+    h = self.hil('lib/mcu/st/stm32h7xx_hal_driver')
+    self.assertEqual((h['full'], h['boards'], h['uncovered']), (False, ['daisy_seed'], []))
+    h = self.hil('lib/mcu/nxp/mcux-sdk')   # kinetis_k32l2, lpc55 and mimxrt10xx
+    self.assertEqual((h['boards'], [u['target'] for u in h['uncovered']]),
+                     ([], ['kinetis_k32l2', 'lpc55', 'mimxrt10xx']))
+
+  def test_an_espressif_board_keeps_its_idf_build(self):
+    self.roster.write_text(json.dumps({'boards': [{'name': 'espressif_esp32s3_devkitc_1', 'flasher': {'name': 'esptool'}}]}))
+    board = 'ports/espressif/boards/espressif_esp32s3_devkitc_1'
+    self.assertEqual(sorted(cb.select([f'{board}/sdkconfig'])['boards']),
+                     [('espressif_esp32s3_devkitc_1', 'idf')])
+    for path in (f'{board}/sdkconfig', f'{board}/board.cmake', 'ports/espressif/CMakeLists.txt'):
+      h = self.hil(path)
+      self.assertEqual((h['boards'], h['uncovered']), (['espressif_esp32s3_devkitc_1'], []), path)
+
+  def test_codeqls_build_is_cis_not_the_hils(self):
+    self.roster.write_text(json.dumps({'boards': [{'name': 'feather_stm32f405_express'}]}))
+    self.assertEqual(classify(cb.CODEQL)[2], [('feather_stm32f405_express', 'cmake')])
+    h = self.hil('.github/workflows/codeql-buildscript.sh')
+    self.assertEqual((h['full'], h['boards'], h['uncovered']), (False, [], []))
 
   def test_unreadable_roster_fails(self):
     self.roster.write_text('{}')
@@ -502,6 +870,16 @@ class Identity(ScratchRepo):
     (self.dep / 'new.h').write_text('untracked')
     self.assertEqual(cb.identity({'lpc55'})['dirtyInputs'], ['lib/mcu/dep'])
 
+  def test_an_ignored_host_roster_leaves_the_tree_clean(self):
+    (self.repo / '.gitignore').write_text((ROOT / '.gitignore').read_text())
+    self.git('add', '.gitignore', cwd=self.repo)
+    self.git('commit', '-q', '-m', 'ignore', cwd=self.repo)
+    (self.repo / 'test' / 'hil').mkdir(parents=True)
+    (self.repo / 'test' / 'hil' / 'local.json').write_text('{"boards": []}')
+    self.assertFalse(cb.identity({'lpc55'})['dirty'])
+    (self.repo / 'x.c').write_text('changed')
+    self.assertTrue(cb.identity({'lpc55'})['dirty'])
+
 
 class Verdict(unittest.TestCase):
   def test_pass(self):
@@ -553,30 +931,63 @@ class Verdict(unittest.TestCase):
     self.assertEqual(e.exception.code, 2)
     self.assertIn('--worktree needs --base', json.loads(out.getvalue())['error'])
 
-  def test_backend_override_needs_board_and_shared_and_a_cmake_build(self):
-    for argv, error in ((['--board', 'imxrt1060_evk', '--backend', 'cmake'], '--backend needs --board and --shared'),
-                        (['--scope', 'src', '--shared', '--backend', 'cmake'], '--backend needs --board and --shared'),
-                        (['--board', 'espressif_esp32s3_devkitm_1', '--shared', '--backend', 'cmake'],
-                         'ports/espressif has no cmake build')):
-      with self.subTest(argv), contextlib.redirect_stdout(io.StringIO()) as out, \
+  def test_a_variant_needs_board_shared_and_a_plain_name(self):
+    for argv in (['--board', 'metro_m7_1011', '--variant', 'v'], ['--scope', 'src', '--shared', '--variant', 'v'],
+                 ['--board', 'metro_m7_1011', '--shared', '--variant', '../v']):
+      with self.subTest(argv), contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit) as e, \
            mock.patch.object(cb, 'build_board', side_effect=AssertionError('built')):
-        try:
-          code = cb.main(argv)
-        except SystemExit as e:
-          code = e.code
-      self.assertEqual(code, 2)
-      self.assertIn(error, json.loads(out.getvalue().splitlines()[-1])['error'])
+        cb.main(argv)
+      self.assertEqual(e.exception.code, 2)
+      self.assertIn('--variant needs --board and --shared', json.loads(out.getvalue().splitlines()[-1])['error'])
 
-  def test_backend_override_builds_with_cmake(self):
-    seen = []
-    def build_board(board, backend, args, idf, flasher=None):
-      seen.append(backend)
-      return {'board': board, 'port': 'mimxrt10xx', 'backend': backend, 'buildDir': 'cmake-build/x', 'status': 'ok',
-              'firstError': '', 'artifacts': [], 'sha256': {}}
-    with mock.patch.object(cb, 'build_board', build_board), \
-         mock.patch.object(cb, 'identity', lambda ports=(): {'head': 'h', 'dirty': False, 'submodules': {}, 'deps': {}, 'dirtyInputs': [], 'missingInputs': [], 'depsOffPin': []}), contextlib.redirect_stdout(io.StringIO()):
-      self.assertEqual(cb.main(['--board', 'imxrt1060_evk', '--shared', '--backend', 'cmake']), 0)
-    self.assertEqual(seen, ['cmake'])
+  def test_a_build_dir_needs_one_board_without_shared_and_a_fresh_dir(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      used, link = Path(tmp) / 'used', Path(tmp) / 'link'
+      used.mkdir()
+      (used / 'keep.c').write_text('source')
+      link.symlink_to(Path(tmp) / 'absent')
+      for argv, error in ((['--scope', 'src', '--build-dir', f'{tmp}/x'], '--build-dir needs one --board'),
+                          (['--board', 'a', '--board', 'b', '--build-dir', f'{tmp}/x'], '--build-dir needs one --board'),
+                          (['--board', 'a', '--shared', '--build-dir', f'{tmp}/x'], '--build-dir needs one --board'),
+                          (['--board', 'a', '--build-dir', str(used)], 'must be absent or an empty directory'),
+                          (['--board', 'a', '--build-dir', str(link)], 'must be absent or an empty directory')):
+        with self.subTest(argv), contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit) as e, \
+             mock.patch.object(cb, 'build_board', side_effect=AssertionError('built')):
+          cb.main(argv)
+        self.assertEqual(e.exception.code, 2)
+        self.assertIn(error, json.loads(out.getvalue().splitlines()[-1])['error'])
+      self.assertEqual((used / 'keep.c').read_text(), 'source')
+
+  def test_a_build_dir_is_checked_where_it_resolves(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      used, fresh = Path(tmp) / 'used', Path(tmp) / 'fresh'
+      used.mkdir()
+      (used / 'keep.c').write_text('source')
+      fresh.mkdir()
+      with contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit) as e, \
+           mock.patch.object(cb, 'build_board', side_effect=AssertionError('built')):
+        cb.main(['--board', 'a', '--build-dir', f'{tmp}/missing/../used'])
+      self.assertEqual(e.exception.code, 2)
+      self.assertIn(f'({used.resolve()}) must be absent or an empty directory', json.loads(out.getvalue().splitlines()[-1])['error'])
+      self.assertEqual((used / 'keep.c').read_text(), 'source')
+      seen = []
+
+      def build_board(board, backend, args, idf, flasher=None):
+        seen.append(args.build_dir)
+        raise cb.Fail('stop')
+      with mock.patch.object(cb, 'build_board', build_board), \
+           mock.patch.object(cb, 'identity', lambda ports=(): dict(CLEAN)), contextlib.redirect_stdout(io.StringIO()):
+        cb.main(['--board', 'lpcxpresso55s69', '--build-dir', f'{tmp}/missing/../fresh'])
+      self.assertEqual(seen, [fresh.resolve()])
+
+  def test_a_named_board_builds_with_its_ports_one_backend(self):
+    _, r = run_main(['--board', 'swan_r5', '--board', 'frdm_k32l2b', '--board', 'ch32v203_r0_1v0',
+                     '--board', 'espressif_esp32s3_devkitm_1'])
+    self.assertEqual({b['board']: b['backend'] for b in r['boards']},
+                     {'swan_r5': 'cmake', 'frdm_k32l2b': 'cmake', 'ch32v203_r0_1v0': 'cmake',
+                      'espressif_esp32s3_devkitm_1': 'idf'})
+    code, r = run_main(['--board', 'dummy'])   # template_port has no build
+    self.assertEqual((code, r['error']), (2, 'ports/template_port: a template no build compiles'))
 
   def test_passing_private_roots_leave_nothing_in_built(self):
     def build_board(board, backend, args, idf, flasher=None):
@@ -627,57 +1038,82 @@ class BuildBoard(unittest.TestCase):
     for p in patches:
       p.start()
       self.addCleanup(p.stop)
-    self.args = mock.Mock(shared=False, define=['LOG=2'], verbose=False, idf='docker')
+    self.args = mock.Mock(shared=False, define=['LOG=2'], verbose=False, idf='docker', variant=None, build_dir=None)
 
-  def fake_make(self, write):
+  def fake_cmake(self, write):
+    """cb.run with a cmake build that writes `write(root)`, root-relative, into the root it builds."""
     calls = []
 
     def run(cmd, log, verbose, cwd=cb.ROOT):
       cmd = [str(c) for c in cmd]
       calls.append(cmd)
-      root = Path(next(c for c in cmd if c.startswith('BUILD_ROOT='))[len('BUILD_ROOT='):])
-      for rel in write(cmd):
-        (root / rel).parent.mkdir(parents=True, exist_ok=True)
-        (root / rel).write_text('x')
+      if cmd[:2] == ['cmake', '--build']:
+        for rel in write(Path(cmd[2])):
+          (Path(cmd[2]) / rel).parent.mkdir(parents=True, exist_ok=True)
+          (Path(cmd[2]) / rel).write_text('x')
       return 0
     return run, calls
 
-  def test_make_builds_like_ci_and_removes_a_passing_private_root(self):
-    run, calls = self.fake_make(lambda cmd: LPC55_ARTIFACTS if 'copy-artifact' in cmd else [])
+  @staticmethod
+  def lpc55_artifacts(root):
+    return [str(p.relative_to(root)) for p in cb.expected_artifacts('lpc55', 'lpcxpresso55s69', 'cmake', root)]
+
+  def test_cmake_builds_like_ci_and_removes_a_passing_private_root(self):
+    run, calls = self.fake_cmake(self.lpc55_artifacts)
     with mock.patch.object(cb, 'run', run):
-      rec = cb.build_board('lpcxpresso55s69', 'make', self.args, {})
+      rec = cb.build_board('lpcxpresso55s69', 'cmake', self.args, {})
     self.assertEqual(rec['status'], 'ok', rec)
     self.assertTrue(rec['removed'])
-    self.assertIn('_bin/apps/update-tinyuf2-lpcxpresso55s69.uf2', rec['artifacts'])
-    self.assertEqual(rec['notImplemented'], ['apps/erase_firmware'])
-    main, copy = calls[0], calls[1]
-    self.assertIn('self-update', main)
-    self.assertNotIn('copy-artifact', main)   # never beside self-update under -j
-    self.assertIn('copy-artifact', copy)
-    self.assertIn('LOG=2', main)
+    self.assertIn('_bin/tinyuf2.hex', rec['artifacts'])
+    self.assertEqual(rec['notImplemented'], ['self-update'])   # lpc55's cmake build has no updater
+    configure, build = calls
+    self.assertLessEqual({'-G', 'Ninja', '-DCMAKE_BUILD_TYPE=MinSizeRel', '-DBOARD=lpcxpresso55s69', '-DLOG=2'},
+                         set(configure))
+    self.assertEqual(build[:2], ['cmake', '--build'])
     self.assertFalse(list(self.build_dir.iterdir()))
 
   def test_missing_expected_artifact_fails_and_keeps_the_root(self):
-    run, _ = self.fake_make(lambda cmd: LPC55_ARTIFACTS[:2] if 'copy-artifact' in cmd else [])
+    run, _ = self.fake_cmake(lambda root: ['_bin/tinyuf2.bin'])
     with mock.patch.object(cb, 'run', run):
-      rec = cb.build_board('lpcxpresso55s69', 'make', self.args, {})
+      rec = cb.build_board('lpcxpresso55s69', 'cmake', self.args, {})
     self.assertEqual(rec['status'], 'failed')
-    self.assertIn('update-tinyuf2-lpcxpresso55s69.uf2', rec['firstError'])
-    self.assertTrue((self.build_dir / f'cmake-build-agent-{cb.os.getpid()}-lpcxpresso55s69-make').is_dir())
+    self.assertIn('_bin/tinyuf2.hex', rec['firstError'])
+    self.assertTrue((self.build_dir / f'cmake-build-agent-{cb.os.getpid()}-lpcxpresso55s69').is_dir())
 
   def test_shared_root_is_rebuilt_from_clean_and_kept(self):
     self.args.shared = True
-    root = self.build_dir / 'cmake-build-lpcxpresso55s69-make'
+    root = self.build_dir / 'cmake-build-lpcxpresso55s69'
     root.mkdir()
     (root / 'stale.o').write_text('old configuration')
-    run, _ = self.fake_make(lambda cmd: LPC55_ARTIFACTS if 'copy-artifact' in cmd else [])
+    run, _ = self.fake_cmake(self.lpc55_artifacts)
     with mock.patch.object(cb, 'run', run):
-      rec = cb.build_board('lpcxpresso55s69', 'make', self.args, {})
+      rec = cb.build_board('lpcxpresso55s69', 'cmake', self.args, {})
     self.assertEqual(rec['status'], 'ok', rec)
     self.assertNotIn('removed', rec)
     self.assertFalse((root / 'stale.o').exists())
     self.assertEqual(set(rec['sha256']), set(rec['artifacts']))
-    self.assertTrue((root / '_bin' / 'tinyuf2-lpcxpresso55s69.bin').is_file())
+    self.assertTrue((root / '_bin' / 'tinyuf2.bin').is_file())
+
+  def test_a_build_dir_is_built_into_and_kept_wherever_it_is(self):
+    with tempfile.TemporaryDirectory() as out:
+      self.args.build_dir = Path(out) / 'code-size' / 'build'
+      run, _ = self.fake_cmake(self.lpc55_artifacts)
+      with mock.patch.object(cb, 'run', run):
+        rec = cb.build_board('lpcxpresso55s69', 'cmake', self.args, {})
+      self.assertEqual((rec['status'], rec['buildDir']), ('ok', str(self.args.build_dir)), rec)
+      self.assertNotIn('removed', rec)
+      self.assertTrue((self.args.build_dir / '_bin' / 'tinyuf2.bin').is_file())
+    self.assertFalse(list(self.build_dir.iterdir()))
+
+  def test_a_variant_is_a_shared_root_of_its_own_beside_the_plain_one(self):
+    self.args.shared, self.args.variant = True, 'update'
+    run, _ = self.fake_cmake(self.lpc55_artifacts)
+    with mock.patch.object(cb, 'run', run):
+      rec = cb.build_board('lpcxpresso55s69', 'cmake', self.args, {})
+    root = self.build_dir / 'cmake-build-lpcxpresso55s69-variant-update'
+    self.assertEqual((rec['status'], rec['variant'], rec['buildDir']), ('ok', 'update', str(root.relative_to(cb.ROOT))))
+    self.assertTrue((root / '_bin').is_dir())
+    self.assertFalse((self.build_dir / 'cmake-build-lpcxpresso55s69').exists())
 
   def test_an_idf_build_hashes_its_flash_config_and_needs_it(self):
     self.args.shared = True
@@ -714,18 +1150,112 @@ class BuildBoard(unittest.TestCase):
     self.assertEqual(rec['status'], 'failed')
     self.assertIn('update-tinyuf2.uf2', rec['firstError'])
 
-  def test_non_default_backend_gets_its_own_root(self):
-    with mock.patch.object(cb, 'run', lambda cmd, log, verbose, **k: log.write_text('make: *** Error 2') and 1):
-      rec = cb.build_board('feather_stm32f405_express', 'make', self.args, {})
-    self.assertTrue(rec['buildDir'].endswith('feather_stm32f405_express-make'))
+  def test_a_root_is_named_for_its_board_alone(self):
+    fail = lambda cmd, log, verbose, **k: log.write_text('ninja: build stopped') and 1
+    for shared, name in ((False, f'cmake-build-agent-{cb.os.getpid()}-swan_r5'), (True, 'cmake-build-swan_r5')):
+      self.args.shared = shared
+      with mock.patch.object(cb, 'run', fail):
+        rec = cb.build_board('swan_r5', 'cmake', self.args, {})
+      self.assertEqual((rec['status'], Path(rec['buildDir']).name), ('failed', name), shared)
 
   def test_missing_prerequisite_is_an_error_not_a_failure(self):
     with mock.patch.object(cb, 'check_deps', lambda p: 'lib/mcu/nxp/mcux-sdk missing'):
-      rec = cb.build_board('lpcxpresso55s69', 'make', self.args, {})
+      rec = cb.build_board('lpcxpresso55s69', 'cmake', self.args, {})
     self.assertEqual((rec['status'], rec['firstError']), ('error', 'lib/mcu/nxp/mcux-sdk missing'))
 
 
-class HilRecord(unittest.TestCase):
+class CompileFacts(unittest.TestCase):
+  """board_facts.o replays the tinyuf2 target's src/main.c compile, its flags and defines exactly."""
+
+  def setUp(self):
+    tmp = build_tmpdir()
+    self.addCleanup(tmp.cleanup)
+    self.root = Path(tmp.name)
+    self.log = self.root / 'log'
+    self.log.write_text('')
+
+  def facts(self):
+    """compile_facts over the main_command entry, as a HIL record's build composes them."""
+    main = cb.main_command(self.root)
+    return main if isinstance(main, str) else cb.compile_facts(main, self.root, self.log, False)
+
+  def commands(self, *entries):
+    (self.root / 'compile_commands.json').write_text(json.dumps([
+      {'directory': str(self.root), 'file': str(ROOT / f), 'output': out, 'command': cmd} for f, out, cmd in entries]))
+
+  def test_the_compile_drops_lto_and_dependency_output_and_swaps_source_and_object(self):
+    obj = 'CMakeFiles/tinyuf2.dir/src/main.c.obj'
+    self.commands(('src/main.c', obj, f'gcc -DB="x y" -I/inc -flto -MD -MT {obj} -MF{obj}.d -o {obj} -c {ROOT}/src/main.c'),
+                  ('src/main.c', 'apps/blinky.dir/main.c.obj', 'gcc -DAPP -c src/main.c'))
+    ran = []
+    with mock.patch.object(cb, 'run', lambda cmd, log, verbose, cwd: ran.append((cmd, cwd)) or 0):
+      self.assertEqual(self.facts(), '')
+    self.assertEqual(ran, [(['gcc', '-DB=x y', '-I/inc', '-flto', '-o', str(self.root / 'board_facts.o'), '-c',
+                             str(cb.FACTS_SOURCE), '-fno-lto'], str(self.root))])
+
+  def test_no_single_tinyuf2_main_c_command_or_a_failed_compile_fails(self):
+    self.assertIn('compile_commands.json', self.facts())
+    self.commands(('src/ghostfat.c', 'CMakeFiles/tinyuf2.dir/g.obj', 'gcc -c g.c'))
+    self.assertIn('found 0', self.facts())
+    self.commands(('src/main.c', 'CMakeFiles/tinyuf2.dir/m.obj', f'gcc -o m.obj -c {ROOT}/src/main.c'))
+    self.log.write_text('board_facts.c:9:1: error: initializer element is not constant\n')
+    with mock.patch.object(cb, 'run', lambda *a, **k: 1):
+      self.assertIn('initializer element is not constant', self.facts())
+
+  def test_the_compiler_is_the_main_c_commands_with_the_first_line_of_its_version(self):
+    self.commands(('src/main.c', 'CMakeFiles/tinyuf2.dir/m.obj', f'{sys.executable} -o m.obj -c {ROOT}/src/main.c'))
+    version = subprocess.run([sys.executable, '--version'], capture_output=True, text=True).stdout.splitlines()[0]
+    self.assertEqual(cb.compiler_of(cb.main_command(self.root)), {'path': sys.executable, 'version': version})
+    self.commands(('src/main.c', 'CMakeFiles/tinyuf2.dir/m.obj', f'/nonexistent/gcc -o m.obj -c {ROOT}/src/main.c'))
+    self.assertEqual(cb.compiler_of(cb.main_command(self.root)), {'path': '/nonexistent/gcc', 'version': None})
+
+  def test_a_preprocessor_dependency_option_is_refused_rather_than_split(self):
+    self.commands(('src/main.c', 'CMakeFiles/tinyuf2.dir/m.obj',
+                   f'gcc -Wp,-MD,m.d,-DHIL_VALUE=7 -o m.obj -c {ROOT}/src/main.c'))
+    with mock.patch.object(cb, 'run', lambda *a, **k: self.fail('compiled')):
+      self.assertIn("would write the build's own dependency file", self.facts())
+
+
+class FakeTools:
+  """Fake `ninja` and `docker` for a test case whose setUp sets `self.tmp`."""
+
+  def fake_tools(self, **env):
+    """`ninja` and `docker` on PATH that log their argv; as the query, each prints ninja's dry run with a warning on
+    stderr, or with HANG starts a grandchild, adds both pids to `self.pids` and hangs. `docker run` creates the
+    container, CREATE_AFTER s later if set; `docker rm` removes it, or exits RM_EXIT, or touches RM_HANG and hangs; `docker ps` lists it, or exits PS_EXIT."""
+    tools = self.tmp / 'bin'
+    tools.mkdir(exist_ok=True)
+    for name in ('ninja', 'docker'):
+      (tools / name).write_text(FAKE_TOOL.format(python=sys.executable))
+      (tools / name).chmod(0o755)
+    self.tools_log, self.pids = self.tmp / 'tools.log', self.tmp / 'pids'
+    self.tools_log.unlink(missing_ok=True)
+    (self.tmp / 'container').unlink(missing_ok=True)
+    self.addCleanup(self.kill_hung)
+    return mock.patch.dict(os.environ, {'PATH': f'{tools}:{os.environ["PATH"]}', 'TOOLS_LOG': str(self.tools_log),
+                                        'PIDS': str(self.pids), **env})
+
+  def hung(self):
+    return [int(pid) for pid in self.pids.read_text().split()] if self.pids.exists() else []
+
+  def wait_hung(self):
+    """The hung tool's and its grandchild's pids, once both are up (up to 10 s)."""
+    end = time.monotonic() + 10
+    while len(self.hung()) < 2 and time.monotonic() < end:
+      time.sleep(0.05)
+    return self.hung()
+
+  def kill_hung(self):
+    for pid in self.hung():
+      if alive(pid, wait=0):
+        with contextlib.suppress(ProcessLookupError):   # it may exit between the check and the kill
+          os.kill(pid, signal.SIGKILL)
+
+  def tool_calls(self, tool):
+    return [l.split()[1:] for l in self.tools_log.read_text().splitlines() if l.split()[0] == tool]
+
+
+class HilRecord(FakeTools, unittest.TestCase):
   """A HIL record binds the build's own flash target to the roster's probe or bridge."""
 
   def setUp(self):
@@ -733,10 +1263,16 @@ class HilRecord(unittest.TestCase):
     self.addCleanup(tmp.cleanup)
     self.tmp = Path(tmp.name)
     self.roster = self.tmp / 'local.json'
+    # bench boards keep their own flasher; max32666fthr's comes from agentrc's board registry
     self.roster.write_text(json.dumps({'boards': [
       {'name': 'metro_m7_1011', 'uid': 'U', 'flasher': {'name': 'jlink', 'uid': '000801012283', 'args': '-device MIMXRT1011DAE5A'}},
-      {'name': 'espressif_esp32s3_devkitc_1', 'uid': 'M', 'flasher': {'name': 'esptool', 'uid': 'b1', 'args': '--chip esp32s3'}},
-      {'name': 'lpcxpresso55s69', 'uid': 'L', 'flasher': {'name': 'openocd', 'uid': 'x', 'args': '-f a.cfg'}}]}))
+      {'name': 'espressif_esp32s3_devkitc_1', 'uid': 'M', 'flasher': {'name': 'esptool', 'uid': 'b1'},
+       'tinyuf2': {'device': 'esp32s3'}},
+      {'name': 'stm32h563_nucleo', 'uid': 'S', 'flasher': {'name': 'stlink', 'uid': '0023ab'},
+       'tinyuf2': {'device': 'stm32h563zi'}},
+      {'name': 'lpcxpresso55s69', 'uid': 'L', 'flasher': {'name': 'openocd', 'uid': 'x', 'args': '-f a.cfg'}},
+      {'name': 'max32666fthr', 'uid': '0C81464124010B20FF0A08CC2C000000', 'probe': 'E6614C311B597D32'},
+      {'name': 'frdm_k32l2b', 'uid': 'K', 'flasher': {'name': 'pyocd', 'uid': 'p', 'args': '-t k32l2b3'}}]}))
     self.config = str(self.roster.relative_to(ROOT))
 
   def jlink_tree(self, root, script=None, options='-USB 000801012283 -ExitOnError 1 -NoGui 1', interface='swd'):
@@ -746,14 +1282,29 @@ class HilRecord(unittest.TestCase):
             f'-CommandFile {root / "tinyuf2.jlink"}')
     return lambda d, args: subprocess.CompletedProcess(args, 0, f'arm-none-eabi-gcc ...\n{line}\n', '')
 
-  def idf_tree(self, root, chip='esp32s3', extra='', args_file='flash_args'):
+  def stlink_tree(self, root, connect='port=swd sn=0023ab', image=None, go='--go'):
     root.mkdir(parents=True, exist_ok=True)
+    line = f'cd {root} && /home/u/bin/STM32_Programmer_CLI --connect {connect} --write {image or root / "tinyuf2.hex"} {go}'
+    return lambda d, args: subprocess.CompletedProcess(args, 0, f'arm-none-eabi-gcc ...\n{line}\n', '')
+
+  def openocd_tree(self, root, options='-c "adapter serial E6614C311B597D32" -c "adapter usb vid_pid 0x2e8a 0x000c"',
+                   cfgs='-f interface/cmsis-dap.cfg -f target/max32665.cfg', image=None, tool='openocd', extra=''):
+    root.mkdir(parents=True, exist_ok=True)
+    line = (f'cd {root} && {tool} -c "tcl_port disabled; gdb_port disabled" {options} {cfgs} '
+            f'-c "init; halt; program {image or root / "tinyuf2.hex"}" -c reset {extra}-c exit')
+    return lambda d, args: subprocess.CompletedProcess(args, 0, f'arm-none-eabi-gcc ...\n{line}\n', '')
+
+  def idf_tree(self, root, chip='esp32s3', extra='', args_file='flash_args', no_stub=False, stub_config=None):
+    root.mkdir(parents=True, exist_ok=True)
+    if stub_config is not None:
+      (root / 'sdkconfig').write_text(f'CONFIG_IDF_TARGET="{chip}"\n{stub_config}\n')
     (root / 'flash_args').write_text('--flash-mode dio --flash-freq 80m --flash-size 8MB\n0x0 bootloader/bootloader.bin\n'
                                      '0x410000 tinyuf2.bin\n0x8000 partition_table/partition-table.bin\n'
                                      f'0xe000 ota_data_initial.bin\n{extra}')
     line = (f'cd /opt/esp/idf/components/esptool_py && cmake -D IDF_PATH=/opt/esp/idf '
             f'-D "SERIAL_TOOL=/opt/esp/python_env/idf6.1_py3.12_env/bin/python;-m;esptool;--chip;{chip}" '
-            f'-D "SERIAL_TOOL_ARGS=--before=default-reset;--after=hard-reset;write-flash;@{args_file}" '
+            f'-D "SERIAL_TOOL_ARGS=--before=default-reset;--after=hard-reset;{"--no-stub;" if no_stub else ""}'
+            f'write-flash;@{args_file}" '
             f'-D SERIAL_TOOL_IS_WRITE_FLASH=1 -D SERIAL_TOOL_FLASH_ARGS_FILE={args_file} '
             f'-D WORKING_DIRECTORY={root} -P /opt/esp/idf/components/esptool_py/run_serial_tool.cmake')
     return lambda d, args: subprocess.CompletedProcess(args, 0, line + '\n', '')
@@ -762,11 +1313,180 @@ class HilRecord(unittest.TestCase):
     self.assertEqual(cb.roster_flasher(self.config, 'metro_m7_1011'),
                      ({'name': 'jlink', 'uid': '000801012283', 'device': 'MIMXRT1011DAE5A'},
                       ['JLINK_OPTION=-USB 000801012283 -ExitOnError 1 -NoGui 1']))
+    self.assertEqual(cb.roster_flasher(self.config, 'stm32h563_nucleo'),
+                     ({'name': 'stlink', 'uid': '0023ab', 'device': 'stm32h563zi'}, ['STLINK_SERIAL=0023ab']))
     self.assertEqual(cb.roster_flasher(self.config, 'espressif_esp32s3_devkitc_1'),
                      ({'name': 'esptool', 'uid': 'b1', 'device': 'esp32s3'}, []))   # the tty is chosen at flash time
-    for board, err in (('lpcxpresso55s69', 'no HIL flash target'), ('imxrt1060_evk', 'not on')):
+    # the openocd on PATH, the provider's, and the probe by serial and USB ID
+    self.assertEqual(cb.roster_flasher(self.config, 'max32666fthr'),
+                     ({'name': 'openocd', 'uid': 'E6614C311B597D32', 'device': 'max32665', 'vid_pid': '0x2e8a 0x000c'},
+                      ['OPENOCD=openocd', 'OPENOCD_SERIAL=E6614C311B597D32', 'OPENOCD_VID_PID=0x2e8a 0x000c']))
+    for board, err in (('lpcxpresso55s69', 'not the roster form'), ('frdm_k32l2b', 'no HIL flash target'),
+                       ('imxrt1060_evk', 'not on')):
       with self.subTest(board), self.assertRaisesRegex(cb.Fail, err):
         cb.roster_flasher(self.config, board)
+    fl = {'name': 'openocd', 'uid': 'BENCH1', 'args': '-f interface/cmsis-dap.cfg -f target/max32665.cfg'}
+    for vid_pid in (None, '0x2e8a', '0x2e8a 0x000c 0x1366 0x0101', '2e8a 000c', '0x2e8a\t0x000c', '0x2e8a 0x000c;x'):
+      self.roster.write_text(json.dumps({'boards': [{'name': 'max32666fthr', 'uid': 'X',
+                                                     'flasher': dict(fl, **({'vid_pid': vid_pid} if vid_pid else {}))}]}))
+      # the registry refuses a pin outside its own grammar first
+      with self.subTest(vid_pid=vid_pid), self.assertRaisesRegex(cb.Fail, 'needs its probe|vid_pid must be'):
+        cb.roster_flasher(self.config, 'max32666fthr')
+
+  def test_an_esptool_flasher_may_name_the_chips_usj_by_its_mac_form_serial(self):
+    usj = '30:ED:A0:F4:0A:94'
+    self.roster.write_text(json.dumps({'boards': [{'name': 'espressif_esp32s31_func_core', 'uid': '30EDA0F40A94',
+                                                   'flasher': {'name': 'esptool', 'uid': usj},
+                                                   'tinyuf2': {'device': 'esp32s31'}}]}))
+    self.assertEqual(cb.roster_flasher(self.config, 'espressif_esp32s31_func_core'),
+                     ({'name': 'esptool', 'uid': usj, 'device': 'esp32s31'}, []))
+    with tempfile.TemporaryDirectory() as d:
+      cfg = Path(d) / 'r.json'
+      for flasher, t in (({'name': 'esptool', 'uid': usj.lower()}, {'device': 'esp32s3'}),
+                         ({'name': 'esptool', 'uid': usj + ':00'}, {'device': 'esp32s3'}),
+                         ({'name': 'jlink', 'uid': usj, 'args': '-device MIMXRT1011DAE5A'}, {})):
+        cfg.write_text(json.dumps({'boards': [{'name': 'b', 'uid': 'B', 'flasher': flasher, 'tinyuf2': t}]}))
+        with self.subTest(flasher), self.assertRaisesRegex(cb.Fail, 'not the roster form'):
+          cb.roster_flasher(str(cfg), 'b')
+
+  def test_a_route_binds_the_esptool_bindings_segments(self):
+    p4 = 'espressif_p4_function_ev'
+    route = {'name': 'openocd_esp', 'uid': '30:ED:A0:E0:C9:02', 'device': 'esp32p4'}
+    self.roster.write_text(json.dumps({'boards': [
+      {'name': p4, 'uid': 'M', 'flasher': {'name': 'esptool', 'uid': 'b', 'args': '--chip esp32p4'},
+       'tinyuf2': {'routes': [{'flasher': {'name': 'openocd_esp', 'uid': '30:ED:A0:E0:C9:02',
+                                           'args': '-f board/esp32p4-builtin.cfg'}}]}},
+      {'name': 'metro_m7_1011', 'uid': 'U', 'flasher': {'name': 'jlink', 'uid': '1', 'args': '-device MIMXRT1011DAE5A'}}]}))
+    self.assertEqual(cb.roster_routes(self.config, p4), [route])
+    self.assertEqual(cb.roster_routes(self.config, 'metro_m7_1011'), [])
+    inputs = list(cb.FLASH['esptool'][1])
+    rec = {'board': p4, 'flash': {'flasher': {'name': 'esptool', 'uid': 'b', 'device': 'esp32p4'}, 'inputs': inputs}}
+    self.assertEqual(cb.flash_routes(rec, [route]), {'openocd_esp': {'flasher': route, 'inputs': inputs}})
+    with self.assertRaisesRegex(cb.Fail, 'needs the esptool binding of that chip'):
+      cb.flash_routes(rec, [dict(route, device='esp32s3')])
+    with tempfile.TemporaryDirectory() as d:
+      for args in ('-f board/esp32p4-builtin.cfg -c init', '-f interface/esp_usb_jtag.cfg -f target/esp32p4.cfg'):
+        cfg = Path(d) / 'r.json'
+        cfg.write_text(json.dumps({'boards': [{'name': p4, 'tinyuf2': {'routes': [{'flasher': dict(route, args=args)}]}}]}))
+        with self.subTest(args), self.assertRaisesRegex(cb.Fail, 'not the roster form'):
+          cb.roster_routes(str(cfg), p4)
+
+  def test_a_roster_naming_a_board_twice_is_refused_as_the_runner_refuses_it(self):
+    entry = {'name': 'metro_m7_1011', 'uid': 'U', 'flasher': {'name': 'jlink', 'uid': '1', 'args': '-device MIMXRT1011DAE5A'}}
+    self.roster.write_text(json.dumps({'boards': [entry, dict(entry, uid='V')]}))
+    for resolve in (cb.roster_flasher, cb.roster_routes):
+      with self.subTest(resolve.__name__), self.assertRaisesRegex(cb.Fail, "has 2 entries named 'metro_m7_1011'"):
+        resolve(self.config, 'metro_m7_1011')
+    with self.assertRaisesRegex(cb.Fail, 'not on'):
+      cb.roster_routes(self.config, 'imxrt1060_evk')
+
+  def test_an_unbound_query_returns_ninja_stdout_alone_and_a_timeout_kills_it(self):
+    root = self.tmp / 'b'
+    with self.fake_tools():
+      r = cb.ninja_in('cmake', None, None, root, ['-n', '-v'])
+    self.assertEqual(r.stdout, "ninja: Entering directory `x'\n")   # the stderr warning is not in it
+    self.assertEqual((r.returncode, r.stderr), (0, 'ninja: warning: on stderr\n'))
+    with self.fake_tools(HANG='1'), mock.patch.object(cb, 'NINJA_QUERY_TIMEOUT', 0.5), \
+         self.assertRaisesRegex(cb.Fail, '^' + re.escape(f'b: ninja -n -v timed out after {cb.NINJA_QUERY_TIMEOUT}s') + '$'):
+      cb.ninja_in('cmake', None, None, root, ['-n', '-v'])
+    self.assertFalse(alive(self.hung()[0]))
+    self.assertEqual(self.tool_calls('docker'), [])
+
+  def test_a_kill_of_check_builds_process_group_also_ends_its_query(self):
+    # as `timeout` ends what it runs: the whole process group, which the query and what it starts never leave
+    code = LOAD_CB + 'cb.ninja_in("cmake", None, None, Path(sys.argv[2]), ["-n", "-v"])'
+    with self.fake_tools(HANG='1'):
+      outer = subprocess.Popen([sys.executable, '-c', code, str(SCRIPT), str(self.tmp / 'b')], cwd=ROOT,
+                               start_new_session=True)
+    self.wait_hung()
+    os.killpg(outer.pid, signal.SIGKILL)
+    outer.wait()
+    self.assertEqual(len(self.hung()), 2)
+    self.assertEqual([pid for pid in self.hung() if alive(pid)], [])
+
+  def test_a_timed_out_idf_query_removes_its_named_container_or_names_the_one_left(self):
+    root, name, bound = self.tmp / 'b', f'tinyuf2-query-{os.getpid()}-deadbeef', 0.5
+    timed_out = re.escape(f'b: ninja -n -v timed out after {bound}s')
+    cases = (('removed', {}, '$'), ('created after the kill', {'CREATE_AFTER': str(bound + 0.1)}, '$'),
+             ('still listed', {'RM_EXIT': '1'}, re.escape(f'; container {name} still exists: docker rm -f {name}') + '$'))
+    for what, env, tail in cases:
+      with self.subTest(what), self.fake_tools(HANG='1', **env), mock.patch.object(cb, 'git', return_value=str(self.tmp)), \
+           mock.patch.object(cb.uuid, 'uuid4', return_value=mock.Mock(hex='deadbeef')), \
+           mock.patch.object(cb, 'NINJA_QUERY_TIMEOUT', bound), mock.patch.object(cb, 'CONTAINER_SETTLE', 1), \
+           mock.patch.object(cb, 'CONTAINER_GONE_WAIT', 3), self.assertRaisesRegex(cb.Fail, '^' + timed_out + tail):
+        try:
+          cb.ninja_in('idf', 'docker', 'idf:image', root, ['-n', '-v'])
+        finally:
+          query = next(c for c in self.tool_calls('docker') if c[0] == 'run')
+          self.assertEqual((query[query.index('--name') + 1], query[-6:]), (name, ['idf:image', 'ninja', '-C', str(root), '-n', '-v']))
+          self.assertEqual([c for c in self.tool_calls('docker') if c[0] == 'rm'][0], ['rm', '-f', name])
+          # absent once is not gone: a create pending at the kill lands later and is removed too
+          end = time.monotonic() + 5
+          while 'CREATE_AFTER' in env and 'daemon created' not in self.tools_log.read_text() and time.monotonic() < end:
+            time.sleep(0.05)
+          self.assertEqual((self.tmp / 'container').exists(), bool(env.get('RM_EXIT')))
+    calls = []
+
+    def no_docker(cmd, **k):   # the query times out, then docker is gone
+      calls.append(cmd)
+      raise subprocess.TimeoutExpired(cmd, bound) if len(calls) == 1 else FileNotFoundError('docker')
+    with mock.patch.object(cb, 'git', return_value=str(self.tmp)), mock.patch.object(cb, 'NINJA_QUERY_TIMEOUT', bound), \
+         mock.patch.object(cb.uuid, 'uuid4', return_value=mock.Mock(hex='deadbeef')), \
+         mock.patch.object(cb.subprocess, 'run', no_docker), \
+         self.assertRaisesRegex(cb.Fail, '^' + timed_out + re.escape(f'; docker failed (docker), so container {name} may be left')):
+      cb.ninja_in('idf', 'docker', 'idf:image', root, ['-n', '-v'])
+
+  def test_an_interrupted_idf_query_is_killed_and_its_container_removed_and_the_interruption_kept(self):
+    root, name, communicate = self.tmp / 'b', f'tinyuf2-query-{os.getpid()}-deadbeef', subprocess.Popen.communicate
+    for what, env, err in (('removed', {}, ''), ('still listed', {'RM_EXIT': '1'},
+                                                 f'b: interrupted ninja -n -v; container {name} still exists: docker rm -f {name}\n')):
+      interrupted = []
+
+      def ctrl_c(p, *a, **k):   # the query's own communicate only: container_left's docker calls run as usual
+        if not interrupted:
+          interrupted.append(p.pid)
+          raise KeyboardInterrupt
+        return communicate(p, *a, **k)
+      stderr = io.StringIO()
+      with self.subTest(what), self.fake_tools(HANG='1', **env), mock.patch.object(cb, 'git', return_value=str(self.tmp)), \
+           mock.patch.object(cb.uuid, 'uuid4', return_value=mock.Mock(hex='deadbeef')), \
+           mock.patch.object(subprocess.Popen, 'communicate', ctrl_c), mock.patch.object(cb, 'CONTAINER_SETTLE', 0.2), \
+           mock.patch.object(cb, 'CONTAINER_GONE_WAIT', 0.5), contextlib.redirect_stderr(stderr), \
+           self.assertRaises(KeyboardInterrupt):
+        (self.tmp / 'container').touch()   # created before the interruption
+        cb.ninja_in('idf', 'docker', 'idf:image', root, ['-n', '-v'])
+      self.assertEqual((stderr.getvalue(), (self.tmp / 'container').exists()), (err, bool(env)))
+      self.assertIn(['rm', '-f', name], self.tool_calls('docker'))
+      self.assertFalse(alive(interrupted[0]))
+
+  def test_each_unbound_idf_query_gets_a_distinct_container_name(self):
+    root = self.tmp / 'b'
+    ids = [mock.Mock(hex='first'), mock.Mock(hex='second')]
+    with self.fake_tools(), mock.patch.object(cb, 'git', return_value=str(self.tmp)), \
+         mock.patch.object(cb.uuid, 'uuid4', side_effect=ids):
+      cb.ninja_in('idf', 'docker', 'idf:image', root, ['-n', '-v'])
+      cb.ninja_in('idf', 'docker', 'idf:image', root, ['-t', 'commands'])
+    names = [c[c.index('--name') + 1] for c in self.tool_calls('docker') if c[0] == 'run']
+    self.assertEqual(names, [f'tinyuf2-query-{os.getpid()}-first', f'tinyuf2-query-{os.getpid()}-second'])
+
+  def test_an_unbound_idf_querys_container_is_named_for_the_pid_and_a_uuid4(self):   # as hil-contract documents it
+    with self.fake_tools(), mock.patch.object(cb, 'git', return_value=str(self.tmp)):
+      cb.ninja_in('idf', 'docker', 'idf:image', self.tmp / 'b', ['-n', '-v'])
+    [name] = [c[c.index('--name') + 1] for c in self.tool_calls('docker') if c[0] == 'run']
+    self.assertRegex(name, '^' + re.escape(f'tinyuf2-query-{os.getpid()}-') + '[0-9a-f]{32}$')
+
+  def test_the_build_time_commands_query_reads_ninjas_stdout_and_reports_its_stderr(self):
+    # a real query through the unbound ninja_in: a failure's diagnostic is on stderr only, a warning there is never
+    # parsed as a command (#572 B1)
+    flasher = {'name': 'jlink', 'uid': '000801012283', 'device': 'MIMXRT1011DAE5A'}
+    root, query = self.tmp / 'b', functools.partial(cb.ninja_in, 'cmake', None, None)
+    with self.fake_tools(UNKNOWN_TARGET='1'), \
+         self.assertRaisesRegex(cb.Fail, re.escape("ninja: error: unknown target 'tinyuf2-jlink'")):
+      cb.flash_binding(flasher, root, query)
+    line = self.jlink_tree(root)(root, [])
+    with self.fake_tools(STDOUT=line.stdout.strip()):
+      self.assertEqual(cb.flash_binding(flasher, root, query)['command'], line.stdout.splitlines()[1])
+    self.assertEqual(self.tool_calls('ninja'), [['-C', str(root), '-t', 'commands', 'tinyuf2-jlink']])
 
   def test_the_generated_jlink_target_must_name_the_roster_probe_and_the_build_image(self):
     flasher = {'name': 'jlink', 'uid': '000801012283', 'device': 'MIMXRT1011DAE5A'}
@@ -782,6 +1502,46 @@ class HilRecord(unittest.TestCase):
       with self.subTest(what), self.assertRaisesRegex(cb.Fail, 'does not flash'):
         cb.flash_binding(flasher, root, self.jlink_tree(root, **tree))
 
+  def test_the_generated_stlink_target_must_name_the_roster_probe_and_the_build_hex(self):
+    flasher = {'name': 'stlink', 'uid': '0023ab', 'device': 'stm32h563zi'}
+    root = self.tmp / 's'
+    out = cb.flash_binding(flasher, root, self.stlink_tree(root))
+    self.assertEqual((out['target'], out['inputs']), ('tinyuf2-stlink', ['tinyuf2.hex']))
+    for what, tree in (('no probe serial', dict(connect='port=swd')),
+                       ('another probe', dict(connect='port=swd sn=1')),
+                       ('another connect mode', dict(connect='port=swd sn=0023ab mode=UR')),
+                       ('the ELF', dict(image=root / 'tinyuf2.elf')),
+                       ('another image', dict(image=self.tmp / 'other.hex')),
+                       ('no start', dict(go='')),
+                       ('a second write', dict(go=f'--go --write {self.tmp / "o.hex"}'))):
+      with self.subTest(what), self.assertRaisesRegex(cb.Fail, 'does not flash'):
+        cb.flash_binding(flasher, root, self.stlink_tree(root, **tree))
+
+  def test_the_generated_openocd_target_must_name_the_roster_probe_cfgs_and_the_build_hex(self):
+    flasher = {'name': 'openocd', 'uid': 'E6614C311B597D32', 'device': 'max32665', 'vid_pid': '0x2e8a 0x000c'}
+    root = self.tmp / 'o'
+    out = cb.flash_binding(flasher, root, self.openocd_tree(root))
+    self.assertEqual((out['target'], out['inputs']), ('tinyuf2-openocd', ['tinyuf2.hex']))
+    serial, pin = '-c "adapter serial E6614C311B597D32"', '-c "adapter usb vid_pid 0x2e8a 0x000c"'
+    for what, tree in (('no probe serial', dict(options=pin)),
+                       ('another probe', dict(options='-c "adapter serial 1" ' + pin)),
+                       ('no USB ID', dict(options=serial)),
+                       ('another USB ID', dict(options=serial + ' -c "adapter usb vid_pid 0x1366 0x0101"')),
+                       ('another target', dict(cfgs='-f interface/cmsis-dap.cfg -f target/max32690.cfg')),
+                       ('another interface', dict(cfgs='-f interface/jlink.cfg -f target/max32665.cfg')),
+                       ('the ELF', dict(image=root / 'tinyuf2.elf')),
+                       ('another image', dict(image=self.tmp / 'other.hex')),
+                       ('the ADI fork', dict(tool='/home/u/app/openocd_adi/src/openocd')),
+                       ('a script dir', dict(extra='-s /home/u/app/openocd_adi/tcl ')),
+                       ('a second program', dict(extra=f'-c "program {self.tmp / "o.hex"}" '))):
+      with self.subTest(what), self.assertRaisesRegex(cb.Fail, 'does not flash'):
+        cb.flash_binding(flasher, root, self.openocd_tree(root, **tree))
+    # a checkout whose path names openocd: only the command that runs it is the target's
+    noisy = self.openocd_tree(root)
+    query = lambda d, args: subprocess.CompletedProcess(   # noqa: E731
+      args, 0, f'cd /w/hil--openocd-session/b && /usr/bin/cc -c /w/hil--openocd-session/x.c\n{noisy(d, args).stdout}', '')
+    self.assertEqual(cb.flash_binding(flasher, root, query)['command'], noisy(root, []).stdout.splitlines()[1])
+
   def test_the_idf_flash_target_must_write_flash_args_for_the_roster_chip(self):
     flasher = {'name': 'esptool', 'uid': 'b1', 'device': 'esp32s3'}
     root = self.tmp / 'e'
@@ -794,111 +1554,23 @@ class HilRecord(unittest.TestCase):
       with self.subTest(what), self.assertRaisesRegex(cb.Fail, 'does not flash'):
         cb.flash_binding(flasher, root, self.idf_tree(root, **tree))
 
-  def ready(self, flasher, root, tree, steps, nested=(), code=0, banner=True):
-    """flash_ready on `root` whose target dry-runs `steps` and whose bootloader subproject dry-runs `nested`;
-    `banner` False drops ninja's banner from both, 'nested' from the subproject's only."""
-    commands = tree(root)
-    command = cb.flash_binding(flasher, root, commands)['command']
-    flash = {'target': cb.FLASH[flasher['name']][0], 'flasher': flasher, 'command': command}
-
-    def ninja(d, args):
-      self.assertEqual(args[:2], ['-n', '-v'])
-      out = [command if x == 'FLASH' else x for x in (steps if d == root else nested)]
-      return subprocess.CompletedProcess(args, code, 'entrypoint banner\n' + ("ninja: Entering directory `x'\n" if banner is True or banner == 'nested' and d == root else '') +
-                                         ''.join(f'[{i}/9] {x}\n' for i, x in enumerate(out, 1)), '')
-    cb.flash_ready(root, flash, ninja)
-
-  def test_a_flash_target_is_ready_only_when_its_dry_run_shows_just_the_flasher(self):
-    jlink = {'name': 'jlink', 'uid': '000801012283', 'device': 'MIMXRT1011DAE5A'}
-    root = self.tmp / 'b'
-    self.ready(jlink, root, self.jlink_tree, ['FLASH'])
-    rebuild = [f'/usr/bin/arm-none-eabi-gcc -c {ROOT}/src/main.c -o main.c.obj', ': && arm-none-eabi-gcc -o tinyuf2.elf', 'FLASH']
-    for what, steps, kw in (('a rebuild', rebuild, {}), ('a CMake re-run', ['/usr/bin/cmake --regenerate-during-build -S.. -B.'], {}),
-                            ('ninja fails', ['FLASH'], {'code': 1}), ('nothing', [], {}),
-                            ('no ninja banner', ['FLASH'], {'banner': False}),
-                            ('another command', ['JLinkExe -USB 1'], {}), ('the flasher twice', ['FLASH', 'FLASH'], {})):
-      with self.subTest(what), self.assertRaisesRegex(cb.Fail, 'would not run only its flasher'):
-        self.ready(jlink, root, self.jlink_tree, steps, **kw)
-
-  def test_an_idf_flash_target_may_also_run_steps_that_write_no_flash_input(self):
-    esp = {'name': 'esptool', 'uid': 'b1', 'device': 'esp32s3'}
-    root = self.tmp / 'e'
-    cmake, py = '/opt/esp/tools/cmake/3.30.2/bin/cmake', '/opt/esp/python_env/idf5.3_py3.10_env/bin/python'
-    sizes = f'{py} /opt/esp/idf/components/partition_table/check_sizes.py --offset 0x8000'
-    size = (f'cd {root}/esp-idf/esptool_py && {sizes} partition --type app {root}/partition_table/partition-table.bin '
-            f'{root}/tinyuf2.bin')
-    boot_size = f'cd {root}/bootloader/esp-idf/esptool_py && {sizes} bootloader 0x0 {root}/bootloader/bootloader.bin'
-    uf2_size = f'cd {root} && {sizes} partition --type app --subtype factory {root}/partition_table/partition-table.bin {root}/tinyuf2.bin'
-    copies = ' && '.join(f'{cmake} -E copy {root}/{f} {root}/_bin/{Path(f).name}' for f in cb.FLASH['esptool'][1])
-    post = (f'cd {root} && bash {root}/tinyuf2.postbuild.sh && cd {root} && {cmake} -E echo "Copy binaries for artifact" && '
-            f'{copies} && cd {root} && {py}3.10 {ROOT}/lib/uf2/utils/uf2conv.py --carray -o '
-            f'{root}/apps/update_tinyuf2/bootloader_bin.c {root}/tinyuf2.bin')
-    stamps = (f'cd {root} && {cmake} -E make_directory {root}/CMakeFiles && {cmake} -E touch {root}/CMakeFiles/bootloader-complete '
-              f'&& {cmake} -E touch {root}/bootloader-prefix/src/bootloader-stamp/bootloader-done')
-    fresh = [f'cd {root}/bootloader && {cmake} --build .', size, uf2_size, f'cd {root}/bootloader && {cmake} -E echo_append', post,
-             stamps, 'FLASH']
-    script = root / 'tinyuf2.postbuild.sh'
-    good = ('#!/bin/bash\necho "Creating combined.bin"\n'
-            f"esptool --chip esp32s3 merge-bin --output combined.bin $(tr '\\n' ' ' < {root}/flash_args)\n")
-    self.idf_tree(root)
-    script.write_text(good)
-    self.ready(esp, root, self.idf_tree, fresh, [boot_size])
-    cases = (('a CMake re-run', [f'cd {root} && {cmake} --regenerate-during-build -S/p -B{root}'], [boot_size], good),
-             ('an app rebuild', [f'{root}/xtensa-esp32s3-elf-g++ -o tinyuf2.elf'] + fresh, [boot_size], good),
-             ('a bootloader rebuild', fresh, ['xtensa-esp32s3-elf-gcc -c bootloader_start.c', boot_size], good),
-             ('a size check and a copy', [size + f' && cp /tmp/o.bin {root}/tinyuf2.bin', 'FLASH'], [], good),
-             ('a copy out of _bin', [f'{cmake} -E copy /tmp/o.bin {root}/_bin/../tinyuf2.bin', 'FLASH'], [], good),
-             ('a redirect', [f'{cmake} -E echo x > {root}/tinyuf2.bin', 'FLASH'], [], good),
-             ('a changed post-build script', fresh, [boot_size], good + f'cp /tmp/o.bin {root}/tinyuf2.bin\n'),
-             ('a step after the bootloader build', [f'cd {root}/bootloader && {cmake} --build . && {cmake} -E echo_append', 'FLASH'],
-              ['xtensa-esp32s3-elf-gcc -c bootloader_start.c'], good),
-             ('a copy through a symlink', [f'{cmake} -E copy /tmp/o.bin {root}/_bin/alias/tinyuf2.bin', 'FLASH'], [], good),
-             ('a touch of a flash input', [f'{cmake} -E touch {root}/flash_args', 'FLASH'], [], good))
-    (root / '_bin').mkdir()
-    (root / '_bin/alias').symlink_to('..')
-    for what, steps, nested, text in cases:
-      with self.subTest(what), self.assertRaisesRegex(cb.Fail, 'would not run only its flasher'):
-        script.write_text(text)
-        self.ready(esp, root, self.idf_tree, steps, nested)
-    script.write_text(good)
-    (root / '_bin/alias').unlink()
-    (root / '_bin').rmdir()
-    (root / '_bin').symlink_to('.')   # a copy into _bin would land on the input itself
-    with self.subTest('a symlinked _bin'), self.assertRaisesRegex(cb.Fail, 'would not run only its flasher'):
-      self.ready(esp, root, self.idf_tree, [f'{cmake} -E copy /tmp/o.bin {root}/_bin/tinyuf2.bin', 'FLASH'], [boot_size])
-    (root / 'apps').symlink_to('.')
-    (root / 'update_tinyuf2').symlink_to('.')
-    carray = 'cd ' + post.split(' && cd ')[-1]
-    self.ready(esp, root, self.idf_tree, [carray, 'FLASH'], [boot_size])   # before the alias
-    (root / 'bootloader_bin.c').symlink_to('tinyuf2.bin')
-    with self.subTest('a C array onto the image'), self.assertRaisesRegex(cb.Fail, 'would not run only its flasher'):
-      self.ready(esp, root, self.idf_tree, [carray, 'FLASH'], [boot_size])
-    (root / 'combined.bin').symlink_to('tinyuf2.bin')
-    with self.subTest('a post-build onto the image'), self.assertRaisesRegex(cb.Fail, 'would not run only its flasher'):
-      self.ready(esp, root, self.idf_tree, [post.split(' && cd ')[0], 'FLASH'], [boot_size])
-    (root / 'combined.bin').unlink()
-    self.ready(esp, root, self.idf_tree, [post.split(' && cd ')[0], 'FLASH'], [boot_size])
-    (root / '_bin').unlink()
-    (root / '_bin').mkdir()
-    (root / '_bin/image.bin').write_text('x')
-    (root / 'ota_data_initial.bin').unlink(missing_ok=True)
-    (root / 'ota_data_initial.bin').symlink_to('_bin/image.bin')
-    with self.subTest('a copy onto a symlinked input'), self.assertRaisesRegex(cb.Fail, 'would not run only its flasher'):
-      self.ready(esp, root, self.idf_tree, [f'{cmake} -E copy /tmp/o.bin {root}/_bin/image.bin', 'FLASH'], [boot_size])
-    with self.assertRaisesRegex(cb.Fail, 'bootloader: ninja -n failed'):
-      self.ready(esp, root, self.idf_tree, fresh, [boot_size], banner='nested')
-
-  def test_an_idf_bootloader_size_check_is_read_only_at_any_offset(self):
-    root = self.tmp / 'p4'
-    sizes = '/opt/esp/python_env/idf6.1_py3.12_env/bin/python /opt/esp/idf/components/partition_table/check_sizes.py --offset 0x8000'
-    boot_size = lambda arg: f'cd {root}/bootloader && {sizes} bootloader {arg} {root}/bootloader/bootloader.bin'
-    self.assertTrue(cb.idf_step_writes_no_input(boot_size('0x2000'), root, 'esp32p4'))
-    for arg in ('2000', '0x2000 x', '0x20g0'):
-      with self.subTest(arg):
-        self.assertFalse(cb.idf_step_writes_no_input(boot_size(arg), root, 'esp32p4'))
+  def test_the_idf_flash_target_runs_no_stub_only_where_the_build_disables_it(self):
+    flasher = {'name': 'esptool', 'uid': '30:ED:A0:F4:0A:94', 'device': 'esp32s31'}
+    for i, (config, no_stub, ok) in enumerate((('CONFIG_ESPTOOLPY_NO_STUB=y', True, True),
+                                               ('# CONFIG_ESPTOOLPY_NO_STUB is not set', False, True),
+                                               ('CONFIG_ESPTOOLPY_NO_STUB=y', False, False),
+                                               ('# CONFIG_ESPTOOLPY_NO_STUB is not set', True, False))):
+      root = self.tmp / f's31-{i}'
+      tree = self.idf_tree(root, chip='esp32s31', no_stub=no_stub, stub_config=config)
+      with self.subTest(config=config, no_stub=no_stub):
+        if ok:
+          self.assertEqual(cb.flash_binding(flasher, root, tree)['flasher'], flasher)
+        else:
+          with self.assertRaisesRegex(cb.Fail, 'does not flash'):
+            cb.flash_binding(flasher, root, tree)
 
   def test_a_hil_record_pins_the_target_inputs_and_holds_the_build_lock(self):
-    args = mock.Mock(shared=True, define=[], verbose=False, idf='docker')
+    args = mock.Mock(shared=True, define=[], verbose=False, idf='docker', variant=None, build_dir=None)
     built = []
 
     def fake_cmake(port, board, root, defines, log, verbose):
@@ -906,30 +1578,219 @@ class HilRecord(unittest.TestCase):
       lock = root.with_name(root.name + '.lock')
       with open(lock) as f, self.assertRaises(BlockingIOError):   # held while the build runs
         cb.fcntl.flock(f, cb.fcntl.LOCK_EX | cb.fcntl.LOCK_NB)
-      for rel in ('_bin/tinyuf2.bin', '_bin/tinyuf2.hex', '_bin/apps/blinky.uf2', 'tinyuf2.hex'):
+      for rel in ('_bin/tinyuf2.bin', '_bin/tinyuf2.hex', '_bin/apps/blinky.uf2', 'tinyuf2.hex',
+                  *(f for f in cb.FACTS_FILES if f != 'board_facts.o')):
         (root / rel).parent.mkdir(parents=True, exist_ok=True)
         (root / rel).write_text(rel)
-      return True, []
+      return True
+
+    def fake_facts(main, root, log, verbose):
+      (root / 'board_facts.o').write_text('o')
+      return ''
     build_dir = self.tmp / 'cmake-build'   # absent: the first shared build creates it before its lock
     with mock.patch.object(cb, 'BUILD_DIR', build_dir), mock.patch.object(cb, 'check_deps', lambda p: None), \
          mock.patch.object(cb, 'check_tools', lambda *a: None), mock.patch.object(cb, 'build_cmake', fake_cmake), \
-         mock.patch.object(cb, 'expected_artifacts', lambda *a: []), \
+         mock.patch.object(cb, 'expected_artifacts', lambda *a: []), mock.patch.object(cb, 'compile_facts', fake_facts), \
+         mock.patch.object(cb, 'main_command', lambda root: {'command': f'{sys.executable} -c 1'}), \
          mock.patch.object(cb, 'ninja_in', lambda backend, mode, image, root, args: self.jlink_tree(root)(root, args)):
       rec = cb.build_board('metro_m7_1011', 'cmake', args, {}, cb.roster_flasher(self.config, 'metro_m7_1011'))
     self.assertEqual(rec['status'], 'ok', rec)
     self.assertEqual(built, [['JLINK_OPTION=-USB 000801012283 -ExitOnError 1 -NoGui 1']])
     self.assertIn('tinyuf2.hex', rec['sha256'])
     self.assertIn('tinyuf2.jlink', rec['sha256'])
+    self.assertLessEqual(set(cb.FACTS_FILES), set(rec['sha256']))   # what the runner reads the board facts from
     self.assertEqual(rec['flash']['defines'], ['JLINK_OPTION=-USB 000801012283 -ExitOnError 1 -NoGui 1'])
+    self.assertEqual(set(rec['compiler']), {'path', 'version'})   # what a hosted record is pinned by
+
+  def test_a_hil_record_binds_the_agentrc_it_loaded_beside_its_input(self):
+    argv = ['--board', 'metro_m7_1011', '--shared', '--hil-config', self.config]
+    boot = cb.agentrc()
+    code, r = run_main(argv)
+    self.assertEqual((code, r['agentrc']), (0, boot.helper().portable(boot.identity())))
+    self.assertNotIn('agentrc', r['input'])
+    self.assertNotIn('agentrc', run_main(['--board', 'metro_m7_1011'])[1])   # no HIL record, no binding
+    changed = 'skills/hil/scripts/hil_boards.py'
+    with mock.patch.object(boot.helper(), 'drift', return_value=[changed]):
+      code, r = run_main(argv)
+    self.assertEqual((code, r['pass'], 'agentrc' in r), (2, False, False))
+    self.assertIn(f'agentrc {changed} changed since this process loaded it: rebuild', r['error'])
 
   def test_a_hil_record_takes_probe_selection_only_from_the_roster(self):
     for argv in (['--board', 'metro_m7_1011', '--shared', '--hil-config', self.config, '-D', 'JLINK_OPTION=-USB 1'],
                  ['--board', 'metro_m7_1011', '--shared', '--hil-config', self.config, '-D', 'ESPPORT:STRING=/dev/x'],
+                 ['--board', 'max32666fthr', '--shared', '--hil-config', self.config, '-D', 'OPENOCD=/opt/openocd'],
+                 ['--board', 'max32666fthr', '--shared', '--hil-config', self.config, '-D', 'OPENOCD_VID_PID=0x1 0x2'],
                  ['--board', 'metro_m7_1011', '--hil-config', self.config]):
       with self.subTest(argv), contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit) as e:
         cb.main(argv)
       self.assertEqual(e.exception.code, 2)
       self.assertIn('usage', json.loads(out.getvalue())['error'])
+
+
+class IdfBuildContainer(FakeTools, unittest.TestCase):
+  """The ESP-IDF docker build runs in a container named for it, removed when its client is stopped or killed."""
+
+  def setUp(self):
+    tmp = build_tmpdir()
+    self.addCleanup(tmp.cleanup)
+    self.tmp = Path(tmp.name)
+    self.root = self.tmp / 'b'
+    self.root.mkdir()
+    self.log = self.root / 'check_build.log'
+    for p in (mock.patch.object(cb, 'git', return_value=str(self.tmp)), mock.patch.object(cb, 'CONTAINER_SETTLE', 0.2),
+              mock.patch.object(cb, 'CONTAINER_GONE_WAIT', 0.5)):
+      p.start()
+      self.addCleanup(p.stop)
+
+  def build(self, idf_mode='docker'):
+    return cb.build_idf('espressif_esp32s3_devkitc_1', self.root, ['LOG=2'], self.log, False, idf_mode, 'idf:image')
+
+  def fresh(self):
+    """Before each subtest's hang: the last one's processes gone, and its pids and log with them."""
+    self.kill_hung()
+    self.pids.unlink(missing_ok=True)
+    self.log.unlink(missing_ok=True)
+
+  def names(self):
+    return [c[c.index('--name') + 1] for c in self.tool_calls('docker') if c[0] == 'run']
+
+  def after_hang(self, act):
+    """`act(pids)` once the hung client and its grandchild are up, from another thread."""
+    t = threading.Thread(target=lambda: act(self.wait_hung()))
+    t.start()
+    self.addCleanup(t.join)
+
+  def check_build(self, code, **env):
+    """A process running check_build's docker build of `self.root` (LOAD_CB + `code` + the build), as a script:
+    with its SIGTERM handler."""
+    code = (LOAD_CB + 'cb.exit_on_sigterm(); cb.CONTAINER_SETTLE = 0.2; cb.CONTAINER_GONE_WAIT = 0.5; '
+            'root = Path(sys.argv[2]); cb.git = lambda *a: sys.argv[3]; ' + code +
+            'cb.build_idf("espressif_esp32s3_devkitc_1", root, [], root / "check_build.log", False, "docker", "idf:image")')
+    return subprocess.Popen([sys.executable, '-c', code, str(SCRIPT), str(self.root), str(self.tmp)], cwd=ROOT,
+                            stderr=subprocess.PIPE, text=True)
+
+  def test_each_build_runs_in_a_container_of_its_own_name_and_a_pass_removes_nothing(self):
+    with self.fake_tools():
+      self.assertTrue(self.build())
+      self.assertTrue(self.build())
+    names = self.names()
+    self.assertEqual(len(set(names)), 2)
+    for name in names:
+      self.assertRegex(name, '^' + re.escape(f'tinyuf2-build-{os.getpid()}-') + '[0-9a-f]{32}$')
+    line = [l for l in self.tools_log.read_text().splitlines() if l.startswith('docker run')][-1]
+    self.assertTrue(line.startswith(' '.join(cb.idf_docker(self.root, name=names[-1]) + ['idf:image', 'bash', '-c', ''])),
+                    line)
+    self.assertLessEqual({'-DBOARD=espressif_esp32s3_devkitc_1', '-DLOG=2', f'-DARTIFACT_PATH={self.root}/_bin', 'build'},
+                         set(line.split()))
+    self.assertEqual([c[0] for c in self.tool_calls('docker')], ['run', 'run'])
+    log = self.log.read_text().splitlines()[-3:]
+    self.assertEqual((log[0], sorted(log[1:])), ('$ ' + line, ["ninja: Entering directory `x'", 'ninja: warning: on stderr']))
+
+  def test_a_failed_build_stays_failed_and_removes_only_its_own_container(self):
+    with self.fake_tools(UNKNOWN_TARGET='1'):   # the fake daemon keeps the failed run's container
+      self.assertFalse(self.build())
+    name = self.names()[0]
+    self.assertEqual({tuple(c) for c in self.tool_calls('docker') if c[0] != 'run'},
+                     {('rm', '-f', name), ('ps', '-aq', '-f', f'name=^{name}$')})
+    self.assertFalse((self.tmp / 'container').exists())
+    self.assertIn('ninja: error: unknown target', self.log.read_text())
+    self.assertNotIn('docker rm', self.log.read_text())
+
+  def test_ctrl_c_reaps_the_client_and_removes_its_container_or_names_it(self):
+    old = signal.signal(signal.SIGINT, signal.default_int_handler)
+    self.addCleanup(signal.signal, signal.SIGINT, old)
+    main = threading.get_ident()
+    for what, env in (('removed', {}), ('still listed', {'RM_EXIT': '1'})):
+      stderr = io.StringIO()
+      with self.subTest(what), self.fake_tools(HANG='1', **env), contextlib.redirect_stderr(stderr):
+        self.fresh()
+        self.after_hang(lambda pids: signal.pthread_kill(main, signal.SIGINT))   # during run()'s streaming read
+        with self.assertRaises(KeyboardInterrupt):
+          self.build()
+        client, name = self.hung()[0], self.names()[0]
+        self.assertFalse(Path(f'/proc/{client}').exists())   # gone, not a zombie: reaped before the cleanup
+        self.assertIn(['rm', '-f', name], self.tool_calls('docker'))
+        left = f'b: interrupted docker build; container {name} still exists: docker rm -f {name}' if env else ''
+        self.assertEqual(((self.tmp / 'container').exists(), stderr.getvalue().strip()), (bool(env), left))
+        self.assertEqual(self.log.read_text().splitlines()[-1] == left, bool(env))
+
+  def test_a_killed_client_fails_the_build_and_its_container_is_removed_or_named(self):
+    kill = lambda pids: [os.kill(pid, signal.SIGKILL) for pid in pids]   # check_build lives on, no exception
+    for what, env, tail in (('removed', {}, ''),
+                            ('still listed', {'RM_EXIT': '1'}, 'container {n} still exists: docker rm -f {n}'),
+                            ('docker ps failing', {'PS_EXIT': '1'}, 'docker ps failed (Cannot connect to the Docker daemon), '
+                                                                     'so container {n} may be left: docker rm -f {n}')):
+      with self.subTest(what), self.fake_tools(HANG='1', **env):
+        self.fresh()
+        self.after_hang(kill)
+        start = time.monotonic()
+        self.assertFalse(self.build())
+        self.assertLess(time.monotonic() - start, 10)
+        name, last = self.names()[0], self.log.read_text().splitlines()[-1]
+        self.assertIn(['rm', '-f', name], self.tool_calls('docker'))
+        self.assertEqual((self.tmp / 'container').exists(), 'RM_EXIT' in env)
+        if tail:
+          self.assertEqual(last, 'b: docker run exited -9; ' + tail.format(n=name))
+        else:
+          self.assertNotIn('docker rm', self.log.read_text())
+
+  def test_an_interrupt_of_a_killed_clients_cleanup_names_the_container_and_is_kept(self):
+    stderr = io.StringIO()
+    with self.fake_tools(HANG='1'), contextlib.redirect_stderr(stderr), \
+         mock.patch.object(cb, 'container_left', side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+      self.after_hang(lambda pids: [os.kill(pid, signal.SIGKILL) for pid in pids])
+      self.build()
+    name = self.names()[0]
+    left = f'b: docker run exited -9; cleanup interrupted, so container {name} may be left: docker rm -f {name}'
+    self.assertEqual((self.log.read_text().splitlines()[-1], stderr.getvalue().strip()), (left, left))
+
+  def test_a_sigterm_to_check_build_ends_it_through_the_cleanup(self):
+    # a real SIGTERM to a process running check_build's build with its handler: no mocked exception
+    with self.fake_tools(HANG='1'):
+      outer = self.check_build('')
+      self.wait_hung()
+      outer.send_signal(signal.SIGTERM)
+      _, err = outer.communicate(timeout=30)
+    self.assertEqual((outer.returncode, err), (128 + signal.SIGTERM, ''))
+    self.assertFalse(alive(self.hung()[0]))
+    self.assertIn(['rm', '-f', self.names()[0]], self.tool_calls('docker'))
+    self.assertFalse((self.tmp / 'container').exists())
+
+  def test_a_second_interrupt_during_the_cleanup_keeps_the_first_and_names_the_container(self):
+    removing = self.tmp / 'removing'
+    with self.fake_tools(HANG='1', RM_HANG=str(removing)):
+      outer = self.check_build('')
+      self.wait_hung()
+      outer.send_signal(signal.SIGTERM)
+      end = time.monotonic() + 10
+      while not removing.exists() and time.monotonic() < end:
+        time.sleep(0.05)
+      outer.send_signal(signal.SIGINT)   # during the blocked `docker rm`
+      _, err = outer.communicate(timeout=30)
+    name = self.names()[0]
+    left = f'b: interrupted docker build; cleanup interrupted, so container {name} may be left: docker rm -f {name}'
+    self.assertEqual((outer.returncode, err.strip(), self.log.read_text().splitlines()[-1]),
+                     (128 + signal.SIGTERM, left, left))
+
+  def test_the_diagnostic_cannot_mask_the_interruption(self):
+    stderr = mock.Mock(write=mock.Mock(side_effect=OSError('stderr closed')))
+    with mock.patch.object(cb, 'run', side_effect=SystemExit(128 + signal.SIGTERM)), \
+         mock.patch.object(cb, 'container_left', return_value='; container x still exists: docker rm -f x'), \
+         mock.patch('builtins.open', side_effect=OSError('log unwritable')), contextlib.redirect_stderr(stderr), \
+         self.assertRaises(SystemExit) as stopped:
+      self.build()
+    self.assertEqual(stopped.exception.code, 128 + signal.SIGTERM)
+    stderr.write.assert_called()
+
+  def test_a_local_idf_build_runs_no_docker_cleanup(self):
+    with mock.patch.object(cb, 'run', return_value=1) as run, mock.patch.object(cb, 'container_left') as left:
+      self.assertFalse(self.build('local'))
+    self.assertEqual(run.call_args[0][0][0], 'idf.py')
+    left.assert_not_called()
+    with mock.patch.object(cb, 'run', side_effect=KeyboardInterrupt), mock.patch.object(cb, 'container_left') as left, \
+         self.assertRaises(KeyboardInterrupt):
+      self.build('local')
+    left.assert_not_called()
 
 
 class Ghostfat(unittest.TestCase):
@@ -971,7 +1832,7 @@ class BackendCommands(unittest.TestCase):
 
   def test_cmake_configures_into_the_root_with_artifacts_there(self):
     with self.capture():
-      ok, _ = cb.build_cmake('stm32f4', 'feather_stm32f405_express', self.root, ['LOG=2'], Path('log'), False)
+      ok = cb.build_cmake('stm32f4', 'feather_stm32f405_express', self.root, ['LOG=2'], Path('log'), False)
     self.assertTrue(ok)
     cfg, build = self.calls
     self.assertEqual(cfg[cfg.index('-B') + 1], str(self.root))
@@ -981,13 +1842,13 @@ class BackendCommands(unittest.TestCase):
 
   def test_cmake_configure_failure_skips_the_build(self):
     with self.capture([1]):
-      ok, _ = cb.build_cmake('stm32f4', 'feather_stm32f405_express', self.root, [], Path('log'), False)
+      ok = cb.build_cmake('stm32f4', 'feather_stm32f405_express', self.root, [], Path('log'), False)
     self.assertFalse(ok)
     self.assertEqual(len(self.calls), 1)
 
   def test_idf_runs_ci_image_with_the_git_common_dir_mounted(self):
     with self.capture([1]), mock.patch.object(cb, 'git', lambda *a: '/srv/repo/.git\n'):
-      ok, _ = cb.build_idf('espressif_esp32s3_devkitm_1', self.root, ['LOG=2'], Path('log'), False, 'docker',
+      ok = cb.build_idf('espressif_esp32s3_devkitm_1', self.root, ['LOG=2'], Path('log'), False, 'docker',
                            'espressif/idf:v6.1')
     self.assertFalse(ok)
     [cmd] = self.calls
@@ -1008,7 +1869,8 @@ class BackendCommands(unittest.TestCase):
                       '_bin/apps/erase_firmware.uf2'})
     self.assertLessEqual({'_bin/combined.bin', '_bin/apps/update-tinyuf2.uf2'},
                          names('espressif', 'espressif_esp32s3_devkitm_1', 'idf'))
-    self.assertNotIn('_bin/apps/update-tinyuf2-swan_r5.uf2', names('stm32l4', 'swan_r5', 'make'))
+    for port, board in (('stm32l4', 'swan_r5'), ('kinetis_k32l2', 'frdm_k32l2b'), ('ch32v20x', 'ch32v203_r0_1v0')):
+      self.assertEqual(names(port, board, 'cmake'), {'_bin/tinyuf2.bin', '_bin/tinyuf2.hex'}, board)   # no apps
     # mimxrt10xx copies its self-update image to ARTIFACT_PATH instead of building apps/self_update;
     # its board-conditional apps are expected on their boards only
     rt = {'_bin/tinyuf2.bin', '_bin/tinyuf2.hex', '_bin/apps/update-tinyuf2.uf2', '_bin/apps/blinky.uf2',
@@ -1019,6 +1881,10 @@ class BackendCommands(unittest.TestCase):
     self.assertEqual(names('mimxrt10xx', 'imxrt1060_evk', 'cmake'), rt)
     self.assertEqual(names('stm32f3', 'stm32f303disco', 'cmake'),
                      {'_bin/tinyuf2.bin', '_bin/tinyuf2.hex', '_bin/apps/update-tinyuf2.uf2', '_bin/apps/blinky.uf2'})
+    for board in ('daisy_seed', 'mini_stm32h750_v11', 'stm32h743nucleo'):   # its cmake build has no self-update
+      self.assertEqual(names('stm32h7', board, 'cmake'),
+                       {'_bin/tinyuf2.bin', '_bin/tinyuf2.hex', '_bin/apps/blinky.uf2', '_bin/apps/erase_firmware.uf2'},
+                       board)
 
 
 class FirstError(unittest.TestCase):
@@ -1059,6 +1925,36 @@ class FirstError(unittest.TestCase):
   def test_fallback_skips_progress_lines(self):
     log = '[5/9] Building C object x/error.c.obj\nninja: error: loading build.ninja\n'
     self.assertEqual(cb.first_error(log), 'ninja: error: loading build.ninja')
+
+  def test_a_failed_script_test_is_named_with_its_exception_line(self):
+    """From unittest's own report: a multi-line assertion message, a chained exception, and a docstring that unittest
+    prints under the test's id."""
+    with tempfile.TemporaryDirectory() as tmp:
+      Path(tmp, 'test_contract.py').write_text(
+        'import unittest\n'
+        'class Contract(unittest.TestCase):\n'
+        '  def test_diff(self):\n'
+        '    self.assertEqual({"a": 1, "b": [1, 2]}, {"a": 2, "b": [1, 3]})\n'
+        '  def test_chained(self):\n'
+        '    try:\n'
+        '      {}["k"]\n'
+        '    except KeyError as e:\n'
+        '      raise RuntimeError("wrapped") from e\n'
+        '  def test_documented(self):\n'
+        '    """A docstring line."""\n'
+        '    self.fail("documented")\n')
+      for test, verdict, exc in (
+          ('test_diff', 'FAIL', "AssertionError: {'a': 1, 'b': [1, 2]} != {'a': 2, 'b': [1, 3]}"),
+          ('test_chained', 'ERROR', 'RuntimeError: wrapped'),
+          ('test_documented', 'FAIL', 'AssertionError: documented')):
+        with self.subTest(test):
+          real = subprocess.run([sys.executable, '-m', 'unittest', f'test_contract.Contract.{test}'],
+                                capture_output=True, text=True, cwd=tmp)
+          with mock.patch.object(cb.subprocess, 'run', return_value=real):
+            rec = cb.run_tests()
+          self.assertEqual(rec['status'], 'failed')
+          pattern = rf'^{verdict}: {test} \(test_contract\.Contract[^)]*\): {re.escape(exc)}$'
+          self.assertRegex(rec['firstError'], pattern)
 
 
 if __name__ == '__main__':

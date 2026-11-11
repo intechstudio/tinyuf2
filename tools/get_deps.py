@@ -14,6 +14,9 @@ deps_optional = {
     'lib/mcu/analog/msdk' : ['https://github.com/analogdevicesinc/msdk.git',
                             'b20b398d3e5e2007594e54a74ba3d2a2e50ddd75',
                             'maxim'],
+    'lib/mcu/microchip': ['https://github.com/hathach/microchip_driver.git',
+                          '9e8b37e307d8404033bb881623a113931e1edf27',
+                          'samd51'],
     'lib/mcu/nxp/mcux-sdk': ['https://github.com/nxp-mcuxpresso/mcux-sdk.git',
                              '9990f264f98430f6d885041ab0f24224d68f4958',
                              'kinetis_k kinetis_k32l2 kinetis_kl lpc51 lpc54 lpc55 mcx mimxrt10xx'],
@@ -62,6 +65,10 @@ deps_all = {**deps_mandatory, **deps_optional}
 TOP = Path(__file__).parent.parent.resolve()
 
 
+def find_symlink_component(d):
+    return next((p for p in [*reversed(Path(d).parents), Path(d)] if (TOP / p).is_symlink()), None)
+
+
 def run_cmd(cmd):
     r = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if r.returncode != 0:
@@ -77,6 +84,12 @@ def get_a_dep(d):
     url = deps_all[d][0]
     commit = deps_all[d][1]
     families = deps_all[d][2]
+
+    symlink = find_symlink_component(d)
+    if symlink is not None:
+        print(f'Error: refusing to update {d}: {symlink} is a symlink')
+        print(f'Fetch {commit} in the checkout that owns the dependency, then link it here')
+        return 1
 
     print(f'cloning {d} with {url}')
 

@@ -22,11 +22,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # the claude-tests hook reads lib/uf2's uf2conv.py, the RT1062 SDK source and the STM32F303 and STM32F411 CMSIS headers
+      # the claude-tests hook reads lib/uf2's uf2conv.py, agentrc at its pin (test/hil/agentrc.json, which CI loads), the
+      # RT1062 and LPC55S69 SDK sources, the STM32F3/F4/H7 CMSIS headers and the MAX32665 msdk header
       - name: Fetch test inputs
         run: |
-          git submodule update --init lib/uf2
-          python3 tools/get_deps.py mimxrt10xx stm32f3 stm32f4
+          git submodule update --init --depth 1 lib/uf2
+          python3 .claude/skills/hil-contract/scripts/agentrc.py fetch
+          python3 tools/get_deps.py maxim mimxrt10xx stm32f3 stm32f4 stm32h7
 
       - name: Run pre-commit
         uses: pre-commit/action@v3.0.1
@@ -62,27 +64,7 @@ jobs:
   # ---------------------------------------
   # Build ARM
   # ---------------------------------------
-  arm-make:
-    needs: set-matrix
-    uses: ./.github/workflows/build_util.yml
-    strategy:
-      fail-fast: false
-      matrix:
-        port:
-        # Alphabetical order
-        - 'kinetis_k32l2'
-        - 'stm32h7'
-        - 'stm32l4'
-    with:
-      port: ${{ matrix.port }}
-      boards: ${{ toJSON(fromJSON(needs.set-matrix.outputs.json)[matrix.port].board) }}
-      build-system: 'make'
-      toolchain: 'arm-gcc'
-
-  # ---------------------------------------
-  # Build ARM with CMake
-  # ---------------------------------------
-  arm-cmake:
+  arm:
     needs: set-matrix
     uses: ./.github/workflows/build_util.yml
     strategy:
@@ -90,16 +72,19 @@ jobs:
       matrix:
         port:
           # Alphabetical order by family
+          - 'kinetis_k32l2'
           - 'lpc55'
           - 'maxim'
           - 'mimxrt10xx'
+          - 'samd51'
           - 'stm32f3'
           - 'stm32f4'
           - 'stm32h5'
+          - 'stm32h7'
+          - 'stm32l4'
     with:
       port: ${{ matrix.port }}
       boards: ${{ toJSON(fromJSON(needs.set-matrix.outputs.json)[matrix.port].board) }}
-      build-system: 'cmake'
       toolchain: 'arm-gcc'
 
   # ---------------------------------------
@@ -112,7 +97,6 @@ jobs:
     with:
       port: 'espressif'
       boards: ${{ toJSON(fromJSON(needs.set-matrix.outputs.json)['espressif'].board) }}
-      build-system: 'make'
       toolchain: 'esp-idf'
       toolchain_version: 'v6.1'
 
@@ -132,7 +116,6 @@ jobs:
     with:
       port: ${{ matrix.port }}
       boards: ${{ toJSON(fromJSON(needs.set-matrix.outputs.json)[matrix.port].board) }}
-      build-system: 'make'
       toolchain: 'riscv-gcc'
 
   # ---------------------------------------
