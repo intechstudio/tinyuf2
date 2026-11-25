@@ -57,6 +57,8 @@
 | heltec_wireless_tracker | Heltec Wireless Tracker | 0x303A:0x81A1 | https://heltec.org/project/wireless-tracker |
 | hexky_s2 | FutureKeys HexKy-S2 | 0x303A:0x80DA | https://futurekeys.net/index.html |
 | hiibot_iots2 | HIIBOT HiiBot IoTs2 | 0x80E7:0x8111 | https://www.tindie.com/products/bradchan/hiibot-iots2/ |
+| intechstudio_grid | Intech Studio Grid | 0x303A:0x8122 | https://github.com/intechstudio/grid-fw |
+| intechstudio_knot | Intech Studio Knot | 0x303A:0x8124 | https://github.com/intechstudio/knot |
 | lilygo_tdeck | LILYGO T-Deck | 0x303A:0x81B7 | https://github.com/Xinyuan-LilyGO/T-Deck |
 | lilygo_tdisplay_s3 | LILYGO T-Display S3 | 0x303A:0x8140 | https://github.com/Xinyuan-LilyGO/T-Display-S3 |
 | lilygo_tdongle_s3 | LILYGO T-Dongle S3 | 0x303A:0x82C3 | https://github.com/Xinyuan-LilyGO/T-Dongle-S3 |
