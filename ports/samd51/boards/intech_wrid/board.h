@@ -26,6 +26,10 @@
 #ifndef BOARD_H_
 #define BOARD_H_
 
+// Double tap reset enters the bootloader, as with uf2-samdx1; also lets the app request the bootloader
+// by writing DBL_TAP_MAGIC to TINYUF2_DBL_TAP_REG before resetting (grid-fw's grid_platform_system_reset_to_bootloader()).
+#define TINYUF2_DBL_TAP_DFU 1
+
 //--------------------------------------------------------------------+
 // Button, pulled up and active low. Holding it at reset enters the bootloader
 //--------------------------------------------------------------------+
